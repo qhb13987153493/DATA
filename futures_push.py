@@ -6,7 +6,7 @@ import numpy as np
 # ================= 1. 你的账户核心数据 =================
 CAPITAL = 289485
 RISK_PER_TRADE = round(CAPITAL * 0.01) # 单笔风控上限：约 2895 元
-USAGE_RATE = 17.25 # 当前账户使用率 (%)
+USAGE_RATE = 17.25 # 当前账户使用率 (%)，用于顶部进度条显示
 POSITIONS = [
     {"name": "甲醇", "code": "2701", "dir": "空", "lots": 7, "avg": 2889.43},
     {"name": "甲醇", "code": "2701", "dir": "多", "lots": 2, "avg": 3051.50},
@@ -17,6 +17,7 @@ DATA_FILE = "kline_data.json"
 # ====================================================
 
 def get_realtime_quotes():
+    # 加入了 原油 和 焦煤 作为宏观风向标
     symbols = {"甲醇": "nf_MA2701", "PVC": "nf_V2701", "白糖": "nf_SR2701", "焦煤": "nf_JM2701", "原油": "nf_SC2701"}
     url = "http://hq.sinajs.cn/list=" + ",".join(symbols.values())
     headers = {"Referer": "http://finance.sina.com.cn"}
@@ -93,17 +94,19 @@ def get_tech_analysis(q):
         diff = (high - low) if high > low else price * 0.01
         atr = diff / 2
 
+        # 量仓诊断
         if price > open_p and oi > 0: vol_price_state = "增仓上涨"
         elif price < open_p and oi > 0: vol_price_state = "增仓下跌"
         elif price > open_p and oi == 0: vol_price_state = "减仓上涨"
         else: vol_price_state = "减仓下跌"
 
+        # 如果历史数据不够，走日内兜底逻辑
         if not data_d:
             history_list = update_history(name, code, price, high, low, oi)
             if len(history_list) < 20:
                 source_label = f"自建库({len(history_list)}/20)"
                 
-                # 测试期“防逆势陷阱”护盾
+                # 测试期“防逆势陷阱”护盾（红盘不做空，绿盘不做多）
                 if price > pre_settle: # 当日红盘
                     if price >= low + diff * 0.7 and price > open_p: 
                         stage, desc = "日内多头", "红盘且强势，顺势做多。"; order_type = "做多"; stop_loss = low - (atr * 0.3)
@@ -128,6 +131,7 @@ def get_tech_analysis(q):
             else:
                 data_d = history_list; source_label = "自建库"
 
+        # 满20天后，启动完全体指标
         df = pd.DataFrame(data_d)
         df['MA20'] = df['close'].rolling(window=20).mean(); df['MA60'] = df['close'].rolling(window=60).mean()
         df['std'] = df['close'].rolling(window=20).std()
@@ -158,6 +162,7 @@ def get_tech_analysis(q):
                 if j60 > 90: m60_overbought = True
             except: pass
 
+        # 完全体核心判断逻辑
         if last['close'] > ma20 and ma20 > ma60:
             if vol_price_state == "减仓上涨":
                 stage, desc, order_type, stop_loss = "多头陷阱", "价格在涨，但持仓量在减！虚涨，严禁追多！", "观望", 0
@@ -209,7 +214,7 @@ def get_position_advice(pos, current_price):
         mult = MULTIPLIER.get(pos['name'], 10)
         pnl = (current_price - pos['avg']) * pos['lots'] * mult if dir_str == "多" else (pos['avg'] - current_price) * pos['lots'] * mult
         
-        slip_pt = 3
+        slip_pt = 3 # 防扫损滑点
         if pnl < 0:
             if dir_str == "空":
                 cut_price = current_price + (pos['avg'] - current_price) * 0.5 
@@ -236,6 +241,7 @@ def build_html():
     # 顶部权益与进度条
     bar_color = "#52c41a" if USAGE_RATE < 30 else ("#faad14" if USAGE_RATE < 60 else "#f5222d")
     html += f'<div style="background:linear-gradient(135deg,#1a3c6e,#2b5aa0);color:#fff;text-align:center;padding:12px;border-radius:8px;font-size:16px;font-weight:bold;">顶级期货实战指令<br><span style="font-size:12px;">{now} | 权益:{CAPITAL:,}</span></div>'
+    
     html += f'<div style="background:#fff;padding:8px;border:1px solid #ddd;border-radius:6px;margin-top:8px;">'
     html += f'<div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px;"><span>账户使用率</span><span style="color:{bar_color};font-weight:bold;">{USAGE_RATE}%</span></div>'
     html += f'<div style="background:#f0f0f0;height:8px;border-radius:4px;overflow:hidden;"><div style="background:{bar_color};width:{USAGE_RATE}%;height:100%;"></div></div>'
@@ -263,6 +269,7 @@ def build_html():
         html += f'<br><span style="color:#d32f2f;font-weight:bold;font-size:12px;"> ⚠️ 原油异动剧烈，化工品风险放大！</span>'
     html += f'</div>'
 
+    # 核心分析卡片
     analysis_results = []
     for q in main_quotes:
         stage, trend_desc, macd_desc, kdj_desc, source_label, action_plan, order_type, buy_price, stop_loss = get_tech_analysis(q)
