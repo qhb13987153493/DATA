@@ -18,7 +18,7 @@ DATA_FILE = "kline_data.json"
 # ====================================================
 
 def get_realtime_quotes():
-    symbols = {"甲醇": "nf_MA2701", "PVC": "nf_V2701", "白糖": "nf_SR2701", "原油": "nf_SC2701"}
+    symbols = {"甲醇": "nf_MA2701", "PVC": "nf_V2701", "白糖": "nf_SR2701"}
     url = "http://hq.sinajs.cn/list=" + ",".join(symbols.values())
     headers = {"Referer": "http://finance.sina.com.cn"}
     try:
@@ -43,14 +43,26 @@ def get_realtime_quotes():
         return quotes
     except: return []
 
+# 获取外盘 WTI 原油
+def get_wti_oil():
+    try:
+        oil_data = yf.Ticker("CL=F").history(period="2d")
+        if len(oil_data) >= 2:
+            last = oil_data['Close'].iloc[-1]
+            prev = oil_data['Close'].iloc[-2]
+            pct = round((last - prev) / prev * 100, 2)
+            return last, pct
+    except: pass
+    return 0, 0
+
 def get_vix():
     try:
         vix_data = yf.Ticker("^VIX").history(period="2d")
         if len(vix_data) >= 2:
-            vix_last = vix_data['Close'].iloc[-1]
-            vix_prev = vix_data['Close'].iloc[-2]
-            vix_pct = round((vix_last - vix_prev) / vix_prev * 100, 2)
-            return f"{vix_last:.2f} ({vix_pct:+.2f}%)"
+            last = vix_data['Close'].iloc[-1]
+            prev = vix_data['Close'].iloc[-2]
+            pct = round((last - prev) / prev * 100, 2)
+            return f"{last:.2f} ({pct:+.2f}%)"
     except: pass
     return "获取失败"
 
@@ -107,17 +119,34 @@ def get_tech_analysis(q):
     price, high, low = q["price"], q["high"], q["low"]
     data = fetch_kline_multi_source(name, code)
     source_label = "历史数据"
-    stage, desc, mom, kdj = "", "", "", ""
+    
+    # 假设止损空间参数
+    stop_loss = 0
     action_plan = ""
-    atr = (high - low) / 2 if high > low else price * 0.01 # 兜底ATR
+    
+    diff = (high - low) if high > low else price * 0.01
+    atr = diff / 2
 
     if not data:
         history_list = update_history(name, code, price, high, low)
         if len(history_list) < 20:
-            stage, desc = "观望", "数据不足20天，暂用日内振幅推演。"
             source_label = f"自建库({len(history_list)}/20)"
-            action_plan = f"🛑 多看少动：在 {round(low,0)} 到 {round(high,0)} 之间震荡，最好等数据齐全后再开单。"
-            return stage, desc, mom, kdj, source_label, action_plan, atr
+            # 日内兜底逻辑（杜绝空白）
+            amp = round(diff / low * 100, 2) if low > 0 else 0
+            if price >= low + diff * 0.8: 
+                stage, desc = "多头中期(日内)", "收在最高点附近，日内多头占优。"
+            elif price <= low + diff * 0.2: 
+                stage, desc = "空头中期(日内)", "收在最低点附近，日内空头占优。"
+            else: 
+                stage, desc = "观望", "卡在中间，日内多空没分出胜负。"
+            
+            mom = "日内资金波动平稳。" if amp < 2.5 else "日内资金异动剧烈，多空交战激烈。"
+            kdj = f"振幅{amp}%，波动剧烈。" if amp > 2.5 else f"振幅{amp}%，波动正常。"
+            
+            # 给一个日内级别的确切止损
+            stop_loss = low - (atr * 0.3) if "多头" in stage else high + (atr * 0.3)
+            action_plan = f"🛑 多看少动：等数据齐全，或在 <b>{price}</b> 附近轻仓试仓。<br>🚫 暂定止损：<b>{stop_loss:.0f}</b>。"
+            return stage, desc, mom, kdj, source_label, action_plan, price, stop_loss
         else:
             data = history_list
             source_label = "自建库分析"
@@ -148,7 +177,6 @@ def get_tech_analysis(q):
         last, prev = df.iloc[-1], df.iloc[-2]
         ma20 = last['MA20'] if not pd.isna(last['MA20']) else price
         ma60 = last['MA60'] if not pd.isna(last['MA60']) else price
-        
         recent_high = df['high'].tail(10).max()
         recent_low = df['low'].tail(10).min()
 
@@ -156,44 +184,39 @@ def get_tech_analysis(q):
             if last['J'] > 80 or (last['MACD'] > 0 and last['MACD'] < prev['MACD']):
                 stage = "多头后期"
                 desc = "动能衰竭，随时变盘。但【绝不摸顶做空】，耐心等跌破 MA20 再反手！"
-                action_plan = f"🛡️ 只平多不开空：手里的多单在 <b>{recent_high:.0f}</b> 附近落袋。<br>👀 观察线：跌破 <b>{ma20:.0f}</b> 才是右侧做空信号。"
+                stop_loss = recent_high + (atr * 0.5)
+                action_plan = f"🛡️ 只平多不开空：多单在 <b>{recent_high:.0f}</b> 落袋。<br>👀 跌破 <b>{ma20:.0f}</b> 才是右侧做空点。"
             elif last['MACD'] > 0 and last['MACD'] > prev['MACD']:
                 stage = "多头中期"
                 desc = "红柱放大，趋势正猛，回踩上车。"
-                buy_point = ma20 + (atr * 0.2)
                 stop_loss = ma20 - (atr * 1.0)
-                take_profit = recent_high
-                action_plan = f"🚀 顺势做多：回踩 <b>{buy_point:.0f}</b> 加 1 手多。<br>🚫 止损：<b>{stop_loss:.0f}</b>。<br>💰 止盈：<b>{take_profit:.0f}</b>。"
+                action_plan = f"🚀 顺势做多：回踩 <b>{ma20 + (atr*0.2):.0f}</b> 加 1 手多。<br>🚫 止损：<b>{stop_loss:.0f}</b>。"
             else:
                 stage = "多头初期"
                 desc = "刚站上均线，多头试探发力。"
-                buy_point = price
                 stop_loss = recent_low - (atr * 0.5)
-                take_profit = price + (price - stop_loss) * 2.5
-                action_plan = f"🌱 试仓做多：现价 <b>{buy_point:.0f}</b> 轻仓进 1 手多。<br>🚫 止损：<b>{stop_loss:.0f}</b>。<br>💰 止盈：<b>{take_profit:.0f}</b>。"
+                action_plan = f"🌱 试仓做多：现价 <b>{price}</b> 轻仓进 1 手多。<br>🚫 止损：<b>{stop_loss:.0f}</b>。"
         
         elif last['close'] < ma20 and ma20 < ma60:
             if last['J'] < 20 or (last['MACD'] < 0 and last['MACD'] > prev['MACD']):
                 stage = "空头后期"
                 desc = "空头动能衰竭，随时反弹。但【绝不抄底做多】，耐心等突破 MA20 再反手！"
-                action_plan = f"🛡️ 只平空不开多：手里的空单在 <b>{recent_low:.0f}</b> 附近落袋。<br>👀 观察线：突破 <b>{ma20:.0f}</b> 才是右侧做多信号。"
+                stop_loss = recent_low - (atr * 0.5)
+                action_plan = f"🛡️ 只平空不开多：空单在 <b>{recent_low:.0f}</b> 落袋。<br>👀 突破 <b>{ma20:.0f}</b> 才是右侧做多点。"
             elif last['MACD'] < 0 and last['MACD'] < prev['MACD']:
                 stage = "空头中期"
                 desc = "绿柱放大，趋势极弱，反弹诱多。"
-                sell_point = ma20 - (atr * 0.2)
                 stop_loss = ma20 + (atr * 1.0)
-                take_profit = recent_low
-                action_plan = f"🔪 顺势做空：反弹到 <b>{sell_point:.0f}</b> 加 1 手空。<br>🚫 止损：<b>{stop_loss:.0f}</b>。<br>💰 止盈：<b>{take_profit:.0f}</b>。"
+                action_plan = f"🔪 顺势做空：反弹到 <b>{ma20 - (atr*0.2):.0f}</b> 加 1 手空。<br>🚫 止损：<b>{stop_loss:.0f}</b>。"
             else:
                 stage = "空头初期"
                 desc = "刚跌破均线，空头试探砸盘。"
-                sell_point = price
                 stop_loss = recent_high + (atr * 0.5)
-                take_profit = price - (stop_loss - price) * 2.5
-                action_plan = f"🌱 试仓做空：现价 <b>{sell_point:.0f}</b> 轻仓进 1 手空。<br>🚫 止损：<b>{stop_loss:.0f}</b>。<br>💰 止盈：<b>{take_profit:.0f}</b>。"
+                action_plan = f"🌱 试仓做空：现价 <b>{price}</b> 轻仓进 1 手空。<br>🚫 止损：<b>{stop_loss:.0f}</b>。"
         else:
             stage = "观望"
             desc = "多空在均线附近纠缠，方向不明。"
+            stop_loss = recent_low - (atr * 0.5)
             action_plan = f"🛑 多看少动：等突破 {recent_high:.0f} 或跌破 {recent_low:.0f} 再进场。"
 
         if last['MACD'] > 0 and prev['MACD'] <= 0: mom = "刚出红柱（金叉），资金进场。"
@@ -206,39 +229,36 @@ def get_tech_analysis(q):
         elif last['J'] < 20: kdj = f"J值{last['J']:.0f}，严重超卖。"
         else: kdj = f"J值{last['J']:.0f}，情绪正常。"
 
-        return stage, desc, mom, kdj, source_label, action_plan, atr
+        # 传回 price(挂单价), stop_loss(止损价)
+        return stage, desc, mom, kdj, source_label, action_plan, price, stop_loss
     except:
-        return "观望", "解析异常。", "未知", "未知", "报错", "观望为主。", atr
+        return "观望", "解析异常。", "未知", "未知", "报错", "观望为主。", price, price
 
 def build_html():
     now = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime('%m-%d %H:%M')
     quotes = get_realtime_quotes()
     vix_str = get_vix()
-    
-    oil = next((q for q in quotes if q["name"] == "原油"), None)
-    main_quotes = [q for q in quotes if q["name"] != "原油"]
+    oil_price, oil_pct = get_wti_oil()
 
     html = f'<div style="font-family:-apple-system,sans-serif;max-width:600px;color:#000;font-size:14px;">'
     html += f'<div style="background:linear-gradient(135deg,#1a3c6e,#2b5aa0);color:#fff;text-align:center;padding:12px;border-radius:8px;font-size:16px;font-weight:bold;">期货实战下单指令<br><span style="font-size:12px;">{now} | 权益:{CAPITAL:,}</span></div>'
 
     html += f'<div style="background:#f5f7fa;border:1px solid #d9d9d9;border-radius:6px;padding:8px;margin:10px 0;font-size:14px;text-align:center;color:#000;">'
     html += f'🌍 <b>外围情绪 VIX：</b><span style="color:#b71c1c;font-weight:bold;">{vix_str}</span>'
-    
-    if oil:
-        oil_color = "#b71c1c" if oil["pct"] > 0 else "#1b5e20"
-        html += f' | 🛢️ <b>原油异动：</b><span style="color:{oil_color};font-weight:bold;">{oil["pct"]:+.2f}%</span>'
-        if abs(oil["pct"]) >= 2.0:
-            html += f'<br><span style="color:#d32f2f;font-weight:bold;font-size:12px;">⚠️ 原油剧烈波动！化工品易受牵连，请缩小仓位！</span>'
+    if oil_price > 0:
+        oil_color = "#b71c1c" if oil_pct > 0 else "#1b5e20"
+        html += f' | 🛢️ <b>WTI原油：</b><span style="color:{oil_color};font-weight:bold;">{oil_price:.2f} ({oil_pct:+.2f}%)</span>'
+        if abs(oil_pct) >= 2.0:
+            html += f'<br><span style="color:#d32f2f;font-weight:bold;font-size:12px;">⚠️ 外盘原油剧烈波动！化工品极易受牵连，请缩小仓位！</span>'
     html += f'</div>'
 
     html += f'<div style="font-size:16px;font-weight:bold;margin:15px 0 10px 0;text-align:center;color:#000;">📌 核心速览（多红/空绿/观望灰）</div>'
 
-    # 用于记录各个品种的 ATR，给下面资金阶梯用
-    atr_dict = {}
+    analysis_results = [] # 存分析结果给仓位阶梯用
 
-    for q in main_quotes:
-        stage, trend_desc, macd_desc, kdj_desc, data_source, action_plan, atr = get_tech_analysis(q)
-        atr_dict[q["name"]] = atr # 存入字典
+    for q in quotes:
+        stage, trend_desc, macd_desc, kdj_desc, data_source, action_plan, buy_price, stop_loss = get_tech_analysis(q)
+        analysis_results.append({"q": q, "action": action_plan, "buy": buy_price, "stop": stop_loss, "stage": stage})
         
         if "空头" in stage:
             bg_color, border_color = "#f6ffed", "#52c41a" 
@@ -266,33 +286,33 @@ def build_html():
         
         html += f'</div></div>'
 
-    # ================= 核心升级：ATR 波动率资金阶梯 =================
+    # ================= 核心升级：算得清清楚楚的 ATR 资金阶梯 =================
     html += f'<div style="background:#e3f2fd;border-left:4px solid #1e88e5;border-radius:6px;padding:12px;margin:15px 0 10px 0;">'
-    html += f'<div style="font-size:16px;font-weight:bold;margin-bottom:6px;color:#000;">🛡️ 专业波动率仓位控制 (ATR风控)</div>'
-    html += f'<div style="font-size:13px;color:#333;margin-bottom:10px;line-height:1.5;">'
-    html += f'你的单笔风控上限设为总资金的 1%：<b>{RISK_PER_TRADE:,} 元</b>。<br>'
-    html += f'程序已根据各品种当前波动率(ATR)自动反推最大安全手数。<br>'
-    html += f'<span style="color:#d32f2f;font-weight:bold;">（跌破止损价，亏损绝不超过 {RISK_PER_TRADE} 元）</span>'
-    html += f'</div>'
-
-    for q in main_quotes:
+    html += f'<div style="font-size:16px;font-weight:bold;margin-bottom:6px;color:#000;">🛡️ 专业波动率仓位控制 (单笔死亏上限 {RISK_PER_TRADE}元)</div>'
+    
+    for res in analysis_results:
+        q = res["q"]
         name = q["name"]
-        atr = atr_dict.get(name, q["price"] * 0.015) # 拿不到就用 1.5% 兜底
-        # 假设咱们按 1.5倍 ATR 作为止损距离，乘数取自字典
-        stop_dist = atr * 1.5
         mult = MULTIPLIER.get(name, 10)
         
-        # 每手风险金额
-        risk_per_lot = stop_dist * mult
+        # 算出每手亏多少钱（买价与止损价的差距绝对值 * 乘数）
+        points_loss = abs(res["buy"] - res["stop"])
+        money_loss = points_loss * mult
         
-        # 计算手数
-        max_lots = max(int(RISK_PER_TRADE / risk_per_lot), 1)
+        if money_loss == 0:
+            html += f'<div style="font-size:13px;color:#000;margin-bottom:6px;">{name}：当前观望，未给明确挂单，暂不计算。</div>'
+            continue
+            
+        # 算能买几手
+        max_lots = max(int(RISK_PER_TRADE / money_loss), 1)
         first_lots = max(int(max_lots / 2), 1)
         
-        html += f'<div style="font-size:13px;line-height:1.6;margin-bottom:8px;color:#000;background:#fff;padding:6px;border-radius:4px;">'
-        html += f'<b>{name}</b>：每手止损空间约 {int(stop_dist)} 个点，1手亏 {int(risk_per_lot)} 元。<br>'
-        html += f'👉 建议首仓建仓 <b>{first_lots} 手</b>，确认顺势最多加至 <b>{max_lots} 手</b>。'
+        html += f'<div style="font-size:13px;line-height:1.6;margin-bottom:8px;color:#000;background:#fff;padding:8px;border-radius:4px;border:1px solid #bbdefb;">'
+        html += f'<b>{name}</b>：按挂单价 <b>{res["buy"]:.0f}</b> 进场，止损定在 <b>{res["stop"]:.0f}</b>。<br>'
+        html += f'📉 1手亏损约 <b>{money_loss:.0f}</b> 元。按你的风控上限，最多只能下 <b>{max_lots} 手</b>。<br>'
+        html += f'👉 <b>建议首仓下 {first_lots} 手</b>，确认顺势再加。'
         html += f'</div>'
+        
     html += f'</div>'
 
     if POSITIONS:
@@ -303,7 +323,7 @@ def build_html():
         
         html += f'<div style="font-size:13px;color:#000;background:#fff;padding:8px;border-radius:4px;margin-top:8px;border:1px solid #ffcdd2;line-height:1.6;">'
         html += f'<b>职业纪律：</b><br>'
-        html += f'1. 手里的空单是逆势单，如果分析显示“多头强势”，逢高减仓。<br>'
+        html += f'1. 你的空单是逆势单，如果反弹到上面给的压力位，逢高减仓。<br>'
         html += f'2. <b>保本铁律</b>：盈利达 3000元，立刻推保本止损，保证不亏。<br>'
         html += f'3. 绝不扛单，绝不逆势加仓。'
         html += f'</div></div>'
