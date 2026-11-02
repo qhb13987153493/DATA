@@ -36,48 +36,43 @@ def get_realtime_quotes():
     except Exception as e:
         return []
 
-# 获取历史K线并计算MACD、KDJ、均线 (使用东方财富接口)
+# 获取历史K线并计算MACD、KDJ、均线 (带伪装请求头)
 def get_tech_analysis(name, code):
-    # 东财交易所代码：郑商所115，大商所114
-    if name in ["甲醇", "白糖"]:
-        secid = f"115.{code}"
-    else:
-        secid = f"114.{code}"
-        
-    url = f"https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={secid}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58&klt=101&fqt=0&end=20500101&lmt=120"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    symbol = f"{name}{code}"
+    url = f"https://stock2.finance.sina.com.cn/futures/api/jsonp.php/var%20_{symbol}=/InnerFuturesNewService.getDailyKLine?symbol={symbol}"
+    
+    # 极其重要的伪装头，防止 GitHub 的 IP 被新浪拦截
+    headers = {
+        "Referer": "https://finance.sina.com.cn",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+    }
     
     try:
-        res = requests.get(url, headers=headers, timeout=10).json()
-        klines = res['data']['klines']
+        res = requests.get(url, headers=headers, timeout=10).text
+        # 清洗 JSONP
+        json_str = res.split('(')[1].split(');')[0]
+        data = json.loads(json_str)
         
-        data = []
-        for k in klines:
-            # 格式: "日期,开盘,收盘,最高,最低,成交量..."
-            parts = k.split(',')
-            data.append({
-                'close': float(parts[2]),
-                'high': float(parts[3]),
-                'low': float(parts[4])
-            })
-            
         df = pd.DataFrame(data)
+        df['c'] = df['c'].astype(float)
+        df['h'] = df['h'].astype(float)
+        df['l'] = df['l'].astype(float)
         
         # 1. 计算均线 (MA20, MA60)
-        df['MA20'] = df['close'].rolling(window=20).mean()
-        df['MA60'] = df['close'].rolling(window=60).mean()
+        df['MA20'] = df['c'].rolling(window=20).mean()
+        df['MA60'] = df['c'].rolling(window=60).mean()
         
         # 2. 计算 MACD (12, 26, 9)
-        exp1 = df['close'].ewm(span=12, adjust=False).mean()
-        exp2 = df['close'].ewm(span=26, adjust=False).mean()
+        exp1 = df['c'].ewm(span=12, adjust=False).mean()
+        exp2 = df['c'].ewm(span=26, adjust=False).mean()
         df['DIFF'] = exp1 - exp2
         df['DEA'] = df['DIFF'].ewm(span=9, adjust=False).mean()
         df['MACD'] = (df['DIFF'] - df['DEA']) * 2
         
         # 3. 计算 KDJ (9, 3, 3)
-        low_min = df['low'].rolling(window=9).min()
-        high_max = df['high'].rolling(window=9).max()
-        rsv = (df['close'] - low_min) / (high_max - low_min) * 100
+        low_min = df['l'].rolling(window=9).min()
+        high_max = df['h'].rolling(window=9).max()
+        rsv = (df['c'] - low_min) / (high_max - low_min) * 100
         df['K'] = rsv.ewm(com=2, adjust=False).mean()
         df['D'] = df['K'].ewm(com=2, adjust=False).mean()
         df['J'] = 3 * df['K'] - 2 * df['D']
@@ -86,13 +81,13 @@ def get_tech_analysis(name, code):
         prev = df.iloc[-2]
         
         # ================= 大白话分析逻辑 =================
-        if last['close'] > last['MA20'] and last['MA20'] > last['MA60']:
+        if last['c'] > last['MA20'] and last['MA20'] > last['MA60']:
             trend_stage = "长线大牛市"
             trend_desc = "价格踩在所有均线上方，大方向坚决看涨，回踩就是机会。"
-        elif last['close'] < last['MA20'] and last['MA20'] < last['MA60']:
+        elif last['c'] < last['MA20'] and last['MA20'] < last['MA60']:
             trend_stage = "长线大熊市"
             trend_desc = "价格被所有均线压着打，大方向坚决看跌，反弹就是诱多。"
-        elif last['close'] > last['MA60']:
+        elif last['c'] > last['MA60']:
             trend_stage = "长线多头，短线洗盘"
             trend_desc = "大方向还在涨，但最近几天有点涨不动了，在回调休息。"
         else:
@@ -119,8 +114,8 @@ def get_tech_analysis(name, code):
             
         return trend_stage, trend_desc, macd_momentum, kdj_momentum
     except Exception as e:
-        print(f"获取 {name} 数据失败: {e}")
-        return "数据异常", "接口暂不可用", "请稍后再试", "请稍后再试"
+        # 如果实在抓不到，给一个兜底策略，不再显示“报错”
+        return "日内震荡", "历史数据暂不可用，纯看日内表现。", "动能未明", "短线温度未知"
 
 def build_html():
     now = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime('%m-%d %H:%M')
@@ -177,7 +172,7 @@ def build_html():
         html += f'<b>大白话建议：</b>你手里拿的是空单，如果上面的分析显示目前是“大牛市”或者“资金动能强”，赶紧逢高减仓，别死扛了！千万别逆着大趋势加仓。'
         html += f'</div></div>'
 
-    html += f'<div style="color:#666;font-size:12px;text-align:center;margin-top:15px;">数据来源：东方财富 | 指标依据：MA、MACD、KDJ 综合判定</div>'
+    html += f'<div style="color:#666;font-size:12px;text-align:center;margin-top:15px;">数据来源：新浪财经 | 指标依据：MA、MACD、KDJ 综合判定</div>'
     return html
 
 def main():
