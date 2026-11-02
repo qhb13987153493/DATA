@@ -16,7 +16,6 @@ DATA_FILE = "kline_data.json"
 # ====================================================
 
 def get_realtime_quotes():
-    # 加入了 原油 和 焦煤 作为宏观风向标
     symbols = {"甲醇": "nf_MA2701", "PVC": "nf_V2701", "白糖": "nf_SR2701", "焦煤": "nf_JM2701", "原油": "nf_SC2701"}
     url = "http://hq.sinajs.cn/list=" + ",".join(symbols.values())
     headers = {"Referer": "http://finance.sina.com.cn"}
@@ -33,12 +32,15 @@ def get_realtime_quotes():
                 price = float(parts[8]) if parts[8] else float(parts[4])
                 pre_settle = float(parts[4]) if parts[4] else 1
                 pct = round((price - pre_settle) / pre_settle * 100, 2) if pre_settle != 0 else 0
+                
+                open_p = float(parts[1]) if parts[1] and float(parts[1]) > 0 else price
+                high_p = max(float(parts[2]), float(parts[3])) if parts[2] else price
+                low_p = min(float(parts[2]), float(parts[3])) if parts[3] else price
+                
                 oi = float(parts[13]) if len(parts)>13 and parts[13] else 0 
                 quotes.append({
                     "name": name, "code": code, "price": price, "pct": pct,
-                    "open": float(parts[1]) if parts[1] else 0, 
-                    "high": max(float(parts[2]), float(parts[3])), 
-                    "low": min(float(parts[2]), float(parts[3])),
+                    "open": open_p, "high": high_p, "low": low_p,
                     "pre_settle": pre_settle, "oi": oi
                 })
         return quotes
@@ -90,29 +92,23 @@ def get_tech_analysis(q):
         diff = (high - low) if high > low else price * 0.01
         atr = diff / 2
 
-        # 量仓诊断
         if price > open_p and oi > 0: vol_price_state = "增仓上涨"
         elif price < open_p and oi > 0: vol_price_state = "增仓下跌"
         elif price > open_p and oi == 0: vol_price_state = "减仓上涨"
         else: vol_price_state = "减仓下跌"
 
-        # 放宽跳空阈值到 3.0%
-        gap_pct = abs(open_p - pre_settle) / pre_settle * 100 if pre_settle > 0 else 0
-        
         if not data_d:
             history_list = update_history(name, code, price, high, low, oi)
             if len(history_list) < 20:
                 source_label = f"自建库({len(history_list)}/20)"
-                if gap_pct > 3.0:
-                    return "极端跳空", "开盘偏离昨结超3%，情绪异常。", vol_price_state, "未知", source_label, "🛑 情绪盘，停止挂单。", "观望", price, 0
-                elif price >= low + diff * 0.7 and price > open_p: 
+                if price >= low + diff * 0.7 and price > open_p: 
                     stage, desc = "多头中期(日内)", "日内多头占优。"; order_type = "做多"; stop_loss = low - (atr * 0.3)
                     action_plan = f"🛑 轻仓试多：现价 <b>{price}</b>。<br>🚫 止损：<b>{stop_loss:.0f}</b>。"
                 elif price <= low + diff * 0.3 and price < open_p: 
                     stage, desc = "空头中期(日内)", "日内空头占优。"; order_type = "做空"; stop_loss = high + (atr * 0.3)
                     action_plan = f"🛑 轻仓试空：现价 <b>{price}</b>。<br>🚫 止损：<b>{stop_loss:.0f}</b>。"
                 else: 
-                    stage, desc, order_type, stop_loss = "观望", "卡在中间。", "观望", 0
+                    stage, desc, order_type, stop_loss = "观望", "卡在中间，日内外无方向。", "观望", 0
                     action_plan = f"🛑 多看少动。"
                 return stage, desc, vol_price_state, "日内波动", source_label, action_plan, order_type, price, stop_loss
             else:
@@ -137,7 +133,6 @@ def get_tech_analysis(q):
         upper, lower = last['upper'] if not pd.isna(last['upper']) else price*2, last['lower'] if not pd.isna(last['lower']) else price*0.5
         filter_band = atr * 0.3
 
-        # 60分钟共振过滤
         m60_overbought = False
         if data_60:
             try:
@@ -149,10 +144,7 @@ def get_tech_analysis(q):
                 if j60 > 90: m60_overbought = True
             except: pass
 
-        if gap_pct > 3.0:
-            stage, desc, order_type, stop_loss = "极端跳空", "开盘跳空超3%，原指标失效。", "观望", 0
-            action_plan = f"🛑 等待缺口回补，或站稳均线（{ma20:.0f}）再操作。"
-        elif last['close'] > ma20 and ma20 > ma60:
+        if last['close'] > ma20 and ma20 > ma60:
             if vol_price_state == "减仓上涨":
                 stage, desc, order_type, stop_loss = "多头陷阱", "价格在涨，但持仓量在减！虚涨，严禁追多！", "观望", 0
                 action_plan = f"🚫 严禁追多：主力在撤退，多单赶紧落袋。"
@@ -251,7 +243,7 @@ def build_html():
         stage, trend_desc, macd_desc, kdj_desc, source_label, action_plan, order_type, buy_price, stop_loss = get_tech_analysis(q)
         analysis_results.append({"q": q, "order_type": order_type, "buy": buy_price, "stop": stop_loss})
         
-        color_map = {"空头": ("#f6ffed", "#52c41a"), "多头": ("#fff5f5", "#ff4d4f"), "跳空": ("#fff8e1", "#f57c00"), "陷阱": ("#fff8e1", "#f57c00")}
+        color_map = {"空头": ("#f6ffed", "#52c41a"), "多头": ("#fff5f5", "#ff4d4f"), "陷阱": ("#fff8e1", "#f57c00")}
         bg_color, border_color = "#f5f5f5", "#d9d9d9"
         for k, v in color_map.items():
             if k in stage: bg_color, border_color = v; break
@@ -260,9 +252,6 @@ def build_html():
         html += f'<div style="font-size:16px; font-weight:bold; margin-bottom:8px; border-bottom:1px dashed #ccc; padding-bottom:6px;">'
         html += f'{q["name"]} {q["code"]}：<span style="font-size:20px;">{q["price"]}</span> ({q["pct"]:+.2f}%)<span style="font-size:10px; color:#888; float:right;">{source_label}</span></div>'
         
-        if abs(q["pct"]) > 6.0:  
-            html += f'<div style="background:#d32f2f;color:#fff;padding:6px;border-radius:4px;margin-bottom:8px;font-size:12px;font-weight:bold;">🚨 极端行情：涨跌幅超 6%！禁止追单！</div>'
-
         html += f'<div style="font-size:14px; line-height:1.7;">👉 <b>阶段：</b>{stage}<br>💬 <b>趋势：</b>{trend_desc}<br>🔥 <b>动能/量仓：</b>{macd_desc}<br>🌡️ <b>温度：</b>{kdj_desc}<br>'
         html += f'<div style="background:#fff; border:2px solid {border_color}; padding:10px; border-radius:6px; margin-top:10px;"><div style="font-weight:bold; color:{border_color};">🎯 指令：</div>{action_plan}</div></div></div>'
 
