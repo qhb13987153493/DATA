@@ -43,27 +43,35 @@ def get_realtime_quotes():
         return quotes
     except: return []
 
-def get_wti_oil():
+# 获取宏观数据：WTI原油、美元指数、VIX
+def get_macro_data():
+    oil_price, oil_pct = 0, 0
+    dxy_price, dxy_pct = 0, 0
+    vix_str = "获取失败"
+    
     try:
         oil_data = yf.Ticker("CL=F").history(period="2d")
         if len(oil_data) >= 2:
-            last = oil_data['Close'].iloc[-1]
-            prev = oil_data['Close'].iloc[-2]
-            pct = round((last - prev) / prev * 100, 2)
-            return last, pct
+            oil_price = oil_data['Close'].iloc[-1]
+            oil_pct = round((oil_price - oil_data['Close'].iloc[-2]) / oil_data['Close'].iloc[-2] * 100, 2)
     except: pass
-    return 0, 0
-
-def get_vix():
+    
+    try:
+        dxy_data = yf.Ticker("DX-Y.NYB").history(period="2d")
+        if len(dxy_data) >= 2:
+            dxy_price = dxy_data['Close'].iloc[-1]
+            dxy_pct = round((dxy_price - dxy_data['Close'].iloc[-2]) / dxy_data['Close'].iloc[-2] * 100, 2)
+    except: pass
+    
     try:
         vix_data = yf.Ticker("^VIX").history(period="2d")
         if len(vix_data) >= 2:
-            last = vix_data['Close'].iloc[-1]
-            prev = vix_data['Close'].iloc[-2]
-            pct = round((last - prev) / prev * 100, 2)
-            return f"{last:.2f} ({pct:+.2f}%)"
+            vix_last = vix_data['Close'].iloc[-1]
+            vix_pct = round((vix_last - vix_data['Close'].iloc[-2]) / vix_data['Close'].iloc[-2] * 100, 2)
+            vix_str = f"{vix_last:.2f} ({vix_pct:+.2f}%)"
     except: pass
-    return "获取失败"
+    
+    return oil_price, oil_pct, dxy_price, dxy_pct, vix_str
 
 def update_history(name, code, price, high, low):
     if os.path.exists(DATA_FILE):
@@ -112,6 +120,7 @@ def fetch_kline_multi_source(name, code):
     except: pass
     return None
 
+# ================= 核心职业交易逻辑 =================
 def get_tech_analysis(q):
     name, code = q["name"], q["code"]
     price, high, low, open_p = q["price"], q["high"], q["low"], q["open"]
@@ -120,7 +129,7 @@ def get_tech_analysis(q):
     
     stop_loss = 0
     action_plan = ""
-    order_type = "观望" # 用于指示底层算仓位时是 做多、做空 还是 观望
+    order_type = "观望" 
     
     diff = (high - low) if high > low else price * 0.01
     atr = diff / 2
@@ -130,27 +139,24 @@ def get_tech_analysis(q):
         if len(history_list) < 20:
             source_label = f"自建库({len(history_list)}/20)"
             amp = round(diff / low * 100, 2) if low > 0 else 0
-            
-            # 修复日内方向判定
             if price >= low + diff * 0.7 and price > open_p: 
                 stage, desc = "多头中期(日内)", "收在相对高点，日内多头占优。"
                 order_type = "做多"
                 stop_loss = low - (atr * 0.3)
-                action_plan = f"🛑 数据不足轻仓试多：现价 <b>{price}</b> 附近轻仓。<br>🚫 暂定止损：<b>{stop_loss:.0f}</b>（跌破今日低点认错）。"
+                action_plan = f"🛑 数据不足轻仓试多：现价 <b>{price}</b> 附近轻仓。<br>🚫 止损：<b>{stop_loss:.0f}</b>（跌破今日低点）。"
             elif price <= low + diff * 0.3 and price < open_p: 
                 stage, desc = "空头中期(日内)", "收在相对低点，日内空头占优。"
                 order_type = "做空"
                 stop_loss = high + (atr * 0.3)
-                action_plan = f"🛑 数据不足轻仓试空：现价 <b>{price}</b> 附近轻仓。<br>🚫 暂定止损：<b>{stop_loss:.0f}</b>（突破今日高点认错）。"
+                action_plan = f"🛑 数据不足轻仓试空：现价 <b>{price}</b> 附近轻仓。<br>🚫 止损：<b>{stop_loss:.0f}</b>（突破今日高点）。"
             else: 
                 stage, desc = "观望", "卡在中间，日内多空没分出胜负。"
                 order_type = "观望"
                 stop_loss = 0
-                action_plan = f"🛑 多看少动：等数据齐全，或在 <b>{low:.0f} - {high:.0f}</b> 之间等突破。暂不建议开仓。"
+                action_plan = f"🛑 多看少动：在 <b>{low:.0f} - {high:.0f}</b> 之间等突破。暂不建议开仓。"
             
             mom = "日内资金波动平稳。" if amp < 2.5 else "日内资金异动剧烈，多空交战激烈。"
             kdj = f"振幅{amp}%，波动剧烈。" if amp > 2.5 else f"振幅{amp}%，波动正常。"
-            
             return stage, desc, mom, kdj, source_label, action_plan, order_type, price, stop_loss
         else:
             data = history_list
@@ -160,6 +166,12 @@ def get_tech_analysis(q):
         df = pd.DataFrame(data)
         df['MA20'] = df['close'].rolling(window=20).mean()
         df['MA60'] = df['close'].rolling(window=60).mean()
+        
+        # ================= 布林带计算 (20日, 2倍标准差) =================
+        df['std'] = df['close'].rolling(window=20).std()
+        df['upper_band'] = df['MA20'] + (df['std'] * 2)
+        df['lower_band'] = df['MA20'] - (df['std'] * 2)
+        
         exp1 = df['close'].ewm(span=12, adjust=False).mean()
         exp2 = df['close'].ewm(span=26, adjust=False).mean()
         df['DIFF'] = exp1 - exp2
@@ -182,13 +194,24 @@ def get_tech_analysis(q):
         last, prev = df.iloc[-1], df.iloc[-2]
         ma20 = last['MA20'] if not pd.isna(last['MA20']) else price
         ma60 = last['MA60'] if not pd.isna(last['MA60']) else price
+        upper_band = last['upper_band'] if not pd.isna(last['upper_band']) else price * 2
+        lower_band = last['lower_band'] if not pd.isna(last['lower_band']) else price * 0.5
+        
         recent_high = df['high'].tail(10).max()
         recent_low = df['low'].tail(10).min()
 
+        # 核心逻辑：加入布林带极值拦截
         if last['close'] > ma20 and ma20 > ma60:
-            if last['J'] > 80 or (last['MACD'] > 0 and last['MACD'] < prev['MACD']):
+            # 优先检查布林带是否顶破上轨
+            if last['close'] >= upper_band:
+                stage = "多头极值(超买)"
+                desc = "价格已顶破布林带上轨！乖离率极大，随时有暴跌风险。"
+                order_type = "观望"
+                stop_loss = 0
+                action_plan = f"🚫 严禁追多：获利多单在 <b>{recent_high:.0f}</b> 附近立刻止盈落袋。<br>👀 极端观望：等价格回踩 MA20 ({ma20:.0f}) 附近再看。"
+            elif last['J'] > 80 or (last['MACD'] > 0 and last['MACD'] < prev['MACD']):
                 stage = "多头后期"
-                desc = "动能衰竭，随时变盘。但【绝不摸顶做空】，耐心等跌破 MA20 再反手！"
+                desc = "动能衰竭，随时变盘。绝不摸顶做空，耐心等跌破 MA20。"
                 order_type = "观望"
                 stop_loss = 0
                 action_plan = f"🛡️ 只平多不开空：多单在 <b>{recent_high:.0f}</b> 落袋。<br>👀 跌破 <b>{ma20:.0f}</b> 才是右侧做空点。"
@@ -206,9 +229,16 @@ def get_tech_analysis(q):
                 action_plan = f"🌱 试仓做多：现价 <b>{price}</b> 轻仓进 1 手多。<br>🚫 止损：<b>{stop_loss:.0f}</b>。"
         
         elif last['close'] < ma20 and ma20 < ma60:
-            if last['J'] < 20 or (last['MACD'] < 0 and last['MACD'] > prev['MACD']):
+            # 优先检查布林带是否跌破下轨
+            if last['close'] <= lower_band:
+                stage = "空头极值(超卖)"
+                desc = "价格已跌破布林带下轨！乖离率极大，随时有报复性反弹风险。"
+                order_type = "观望"
+                stop_loss = 0
+                action_plan = f"🚫 严禁追空：获利空单在 <b>{recent_low:.0f}</b> 附近立刻止盈落袋。<br>👀 极端观望：等价格反抽 MA20 ({ma20:.0f}) 附近再看。"
+            elif last['J'] < 20 or (last['MACD'] < 0 and last['MACD'] > prev['MACD']):
                 stage = "空头后期"
-                desc = "空头动能衰竭，随时反弹。但【绝不抄底做多】，耐心等突破 MA20 再反手！"
+                desc = "空头动能衰竭，随时反弹。绝不抄底做多，耐心等突破 MA20。"
                 order_type = "观望"
                 stop_loss = 0
                 action_plan = f"🛡️ 只平空不开多：空单在 <b>{recent_low:.0f}</b> 落袋。<br>👀 突破 <b>{ma20:.0f}</b> 才是右侧做多点。"
@@ -248,17 +278,22 @@ def get_tech_analysis(q):
 def build_html():
     now = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime('%m-%d %H:%M')
     quotes = get_realtime_quotes()
-    vix_str = get_vix()
-    oil_price, oil_pct = get_wti_oil()
+    oil_price, oil_pct, dxy_price, dxy_pct, vix_str = get_macro_data()
 
     html = f'<div style="font-family:-apple-system,sans-serif;max-width:600px;color:#000;font-size:14px;">'
     html += f'<div style="background:linear-gradient(135deg,#1a3c6e,#2b5aa0);color:#fff;text-align:center;padding:12px;border-radius:8px;font-size:16px;font-weight:bold;">期货实战下单指令<br><span style="font-size:12px;">{now} | 权益:{CAPITAL:,}</span></div>'
 
-    html += f'<div style="background:#f5f7fa;border:1px solid #d9d9d9;border-radius:6px;padding:8px;margin:10px 0;font-size:14px;text-align:center;color:#000;">'
-    html += f'🌍 <b>外围情绪 VIX：</b><span style="color:#b71c1c;font-weight:bold;">{vix_str}</span>'
+    # 宏观面板
+    html += f'<div style="background:#f5f7fa;border:1px solid #d9d9d9;border-radius:6px;padding:8px;margin:10px 0;font-size:13px;text-align:center;color:#000;">'
+    html += f'🌍 <b>VIX：</b><span style="color:#b71c1c;font-weight:bold;">{vix_str}</span>'
     if oil_price > 0:
         oil_color = "#b71c1c" if oil_pct > 0 else "#1b5e20"
-        html += f' | 🛢️ <b>WTI原油：</b><span style="color:{oil_color};font-weight:bold;">{oil_price:.2f} ({oil_pct:+.2f}%)</span>'
+        html += f' | 🛢️ <b>WTI：</b><span style="color:{oil_color};font-weight:bold;">{oil_price:.2f} ({oil_pct:+.2f}%)</span>'
+    if dxy_price > 0:
+        dxy_color = "#b71c1c" if dxy_pct > 0 else "#1b5e20"
+        html += f'<br>💵 <b>美元指数：</b><span style="color:{dxy_color};font-weight:bold;">{dxy_price:.2f} ({dxy_pct:+.2f}%)</span>'
+        if dxy_pct > 0.5:
+            html += f'<span style="color:#d32f2f;font-weight:bold;font-size:12px;"> ⚠️ 美元拉升压制大宗！</span>'
     html += f'</div>'
 
     html += f'<div style="font-size:16px;font-weight:bold;margin:15px 0 10px 0;text-align:center;color:#000;">📌 核心速览（多红/空绿/观望灰）</div>'
@@ -306,7 +341,7 @@ def build_html():
         
         if res["order_type"] == "观望" or res["stop"] == 0:
             html += f'<div style="font-size:13px;line-height:1.6;margin-bottom:8px;color:#000;background:#fff;padding:8px;border-radius:4px;">'
-            html += f'<b>{name}</b>：当前为【观望】状态，系统未发出明确做多或做空信号，<b>不建议开新仓</b>，耐心等突破或跌破。'
+            html += f'<b>{name}</b>：当前为【观望/极值】状态，系统未发出明确顺势信号，<b>不建议开新仓</b>。'
             html += f'</div>'
             continue
 
