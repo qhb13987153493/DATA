@@ -3,9 +3,10 @@ import os, json, requests, datetime
 import pandas as pd
 import numpy as np
 
-# ================= 你的账户核心数据 =================
+# ================= 1. 你的账户核心数据 =================
 CAPITAL = 289485
 RISK_PER_TRADE = round(CAPITAL * 0.01) # 单笔风控上限：约 2895 元
+USAGE_RATE = 17.25 # 当前账户使用率 (%)
 POSITIONS = [
     {"name": "甲醇", "code": "2701", "dir": "空", "lots": 7, "avg": 2889.43},
     {"name": "甲醇", "code": "2701", "dir": "多", "lots": 2, "avg": 3051.50},
@@ -102,8 +103,7 @@ def get_tech_analysis(q):
             if len(history_list) < 20:
                 source_label = f"自建库({len(history_list)}/20)"
                 
-                # ============ 修复测试期“逆势陷阱” ============
-                # 红盘时，如果冲高回落，绝不提示做空；绿盘时，如果探底回升，绝不提示做多
+                # 测试期“防逆势陷阱”护盾
                 if price > pre_settle: # 当日红盘
                     if price >= low + diff * 0.7 and price > open_p: 
                         stage, desc = "日内多头", "红盘且强势，顺势做多。"; order_type = "做多"; stop_loss = low - (atr * 0.3)
@@ -120,7 +120,7 @@ def get_tech_analysis(q):
                         stage, desc, order_type, stop_loss = "观望", "虽然绿盘，但探底回升，多空分歧大。", "观望", 0
                         action_plan = f"🛑 多看少动：数据不足期，宁可错过，不逆势做多绿盘。"
                 
-                else: # 平盘
+                else: 
                     stage, desc, order_type, stop_loss = "观望", "平盘震荡，无方向。", "观望", 0
                     action_plan = f"🛑 多看少动。"
                     
@@ -232,14 +232,26 @@ def build_html():
     price_dict = {q["name"]: q["price"] for q in main_quotes}
 
     html = f'<div style="font-family:-apple-system,sans-serif;max-width:600px;color:#000;font-size:14px;">'
+    
+    # 顶部权益与进度条
+    bar_color = "#52c41a" if USAGE_RATE < 30 else ("#faad14" if USAGE_RATE < 60 else "#f5222d")
     html += f'<div style="background:linear-gradient(135deg,#1a3c6e,#2b5aa0);color:#fff;text-align:center;padding:12px;border-radius:8px;font-size:16px;font-weight:bold;">顶级期货实战指令<br><span style="font-size:12px;">{now} | 权益:{CAPITAL:,}</span></div>'
+    html += f'<div style="background:#fff;padding:8px;border:1px solid #ddd;border-radius:6px;margin-top:8px;">'
+    html += f'<div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px;"><span>账户使用率</span><span style="color:{bar_color};font-weight:bold;">{USAGE_RATE}%</span></div>'
+    html += f'<div style="background:#f0f0f0;height:8px;border-radius:4px;overflow:hidden;"><div style="background:{bar_color};width:{USAGE_RATE}%;height:100%;"></div></div>'
+    html += f'</div>'
 
-    month = datetime.datetime.now().month
-    if month in [11, 12]:
+    # 周五过周末警告
+    if datetime.datetime.now().weekday() == 4: # 周五
         html += f'<div style="background:#ffebee;border:2px solid #d32f2f;border-radius:6px;padding:10px;margin:10px 0;font-size:14px;text-align:center;color:#b71c1c;font-weight:bold;">'
-        html += f'🚨 <b>时间警报：01 合约即将交割！</b><br>主力正在移仓换月，流动性骤降，极易假突破，严禁开新仓！'
+        html += f'⚠️ <b>周五过周末警报！</b><br>外盘周末波动剧烈，建议清理逆势单，降低仓位过周末！'
+        html += f'</div>'
+    elif datetime.datetime.now().month in [11, 12]:
+        html += f'<div style="background:#ffebee;border:2px solid #d32f2f;border-radius:6px;padding:10px;margin:10px 0;font-size:14px;text-align:center;color:#b71c1c;font-weight:bold;">'
+        html += f'🚨 <b>时间警报：01 合约即将交割！</b><br>主力正在移仓换月，流动性骤降，严禁开新仓！'
         html += f'</div>'
 
+    # 宏观面板
     html += f'<div style="background:#f5f7fa;border:1px solid #d9d9d9;border-radius:6px;padding:8px;margin:10px 0;font-size:13px;text-align:center;color:#000;">'
     if oil_quote:
         oil_color = "#b71c1c" if oil_quote["pct"] > 0 else "#1b5e20"
@@ -268,6 +280,7 @@ def build_html():
         html += f'<div style="font-size:14px; line-height:1.7;">👉 <b>阶段：</b>{stage}<br>💬 <b>趋势：</b>{trend_desc}<br>🔥 <b>动能/量仓：</b>{macd_desc}<br>🌡️ <b>温度：</b>{kdj_desc}<br>'
         html += f'<div style="background:#fff; border:2px solid {border_color}; padding:10px; border-radius:6px; margin-top:10px;"><div style="font-weight:bold; color:{border_color};">🎯 指令：</div>{action_plan}</div></div></div>'
 
+    # 仓位控制
     html += f'<div style="background:#e3f2fd;border-left:4px solid #1e88e5;border-radius:6px;padding:12px;margin:15px 0 10px 0;">'
     html += f'<div style="font-size:16px;font-weight:bold;margin-bottom:6px;color:#000;">🛡️ 仓位控制 (死亏上限 {RISK_PER_TRADE}元)</div>'
     for res in analysis_results:
@@ -280,6 +293,7 @@ def build_html():
             html += f'<div style="font-size:13px;color:#000;background:#fff;padding:6px;margin-bottom:4px;border-radius:4px;"><b>{q["name"]} ({res["order_type"]})</b>：{res["buy"]:.0f}进场，{res["stop"]:.0f}止损。1手亏{money:.0f}元。最多<b>{max_l}手</b>，首仓<b>{first_l}手</b>。</div>'
     html += f'</div>'
 
+    # 持仓急救
     if POSITIONS:
         html += f'<div style="background:#ffebee;border-left:4px solid #d32f2f;border-radius:6px;padding:12px;margin:10px 0;">'
         html += f'<div style="font-size:16px;font-weight:bold;margin-bottom:8px;color:#000;">🚨 持仓真实急救</div>'
@@ -294,6 +308,7 @@ def build_html():
         html += f'🔍 <b>敞口诊断：</b>当前持仓高度集中在【能化板块】。面临板块单边双杀风险，切忌同向开仓！'
         html += f'</div></div>'
 
+    # 情绪熔断
     html += f'<div style="border-top:1px dashed #999; margin-top:15px; padding-top:10px; font-size:12px; color:#555; line-height:1.5;">'
     html += f'💡 <b>情绪熔断：</b>如果近三天累计亏损超 {int(CAPITAL * 0.03):,} 元，强制空仓休息一天，严禁报复性交易！'
     html += f'</div></div>'
@@ -301,6 +316,11 @@ def build_html():
     return html
 
 def main():
+    # 周末静音逻辑
+    if datetime.datetime.now().weekday() >= 5:
+        print("📅 周末休市，系统静音。")
+        return
+
     token = os.environ.get("PUSHPLUS_TOKEN")
     if not token: 
         print("❌ 未在Secrets中配置PUSHPLUS_TOKEN")
