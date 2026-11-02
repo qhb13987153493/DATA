@@ -49,7 +49,6 @@ def get_tech_analysis(name, code):
         
         data = []
         for k in klines:
-            # 腾讯格式: ["2023-10-24", "开盘", "收盘", "最高", "最低", "成交量"]
             data.append({
                 'close': float(k[2]),
                 'high': float(k[3]),
@@ -136,4 +135,61 @@ def build_html():
         else:
             bg_color, border_color = "#f5f5f5", "#d9d9d9"
 
-        html += f'<div style="background:{bg_color}; border:2px solid {border_color}; border-radius:8px; padding:12px; margin-bottom:12px; box-shadow:0 2px 4px rgba(
+        html += f'<div style="background:{bg_color}; border:2px solid {border_color}; border-radius:8px; padding:12px; margin-bottom:12px; box-shadow:0 2px 4px rgba(0,0,0,0.05);">'
+        
+        html += f'<div style="font-size:16px; font-weight:bold; color:#000; margin-bottom:8px; border-bottom:1px dashed #ccc; padding-bottom:6px;">'
+        html += f'{q["name"]} {q["code"]}：<span style="color:{q["color"]}; font-size:20px;">{q["price"]}</span> <span style="color:{q["color"]}; font-size:14px;">({q["pct"]:+.2f}%)</span>'
+        html += f'</div>'
+        
+        html += f'<div style="color:#000; font-size:14px; line-height:1.7;">'
+        html += f'👉 <b>当前阶段：</b><span style="font-size:16px; font-weight:bold;">{stage}</span><br>'
+        html += f'💬 <b>大白话趋势：</b>{trend_desc}<br>'
+        html += f'🔥 <b>资金动能：</b>{macd_desc}<br>'
+        html += f'🌡️ <b>短线温度：</b>{kdj_desc}'
+        html += f'</div></div>'
+
+    html += f'<div style="background:#fff3e0;border-left:4px solid #f57c00;border-radius:6px;padding:12px;margin:15px 0 10px 0;">'
+    html += f'<div style="font-size:16px;font-weight:bold;margin-bottom:8px;color:#000;">💰 资金阶梯分配表</div>'
+    for q in quotes:
+        m = MULTIPLIER.get(q["name"], 10)
+        margin = round(q["price"] * m * 0.10)
+        first = max(int(CAPITAL * 0.20 / margin), 1)
+        add_lot = max(int(CAPITAL * 0.30 / margin), 1)
+        cap = max(int(CAPITAL * 0.60 / margin), 1)
+        html += f'<div style="font-size:13px;line-height:1.6;margin-bottom:6px;color:#000;">'
+        html += f'<b>{q["name"]}</b>：首仓买 <b>{first}手</b> → 加仓到 {first+add_lot}手 → 最多不超过 <b>{cap}手</b>'
+        html += f'</div>'
+    html += f'<div style="font-size:12px;color:#000;margin-top:6px;font-weight:bold;">⚠️ 注意：上限是“最多能买这么多”，不是让你全买满！</div>'
+    html += f'</div>'
+
+    if POSITIONS:
+        html += f'<div style="background:#ffebee;border-left:4px solid #d32f2f;border-radius:6px;padding:12px;margin:10px 0;">'
+        html += f'<div style="font-size:16px;font-weight:bold;margin-bottom:8px;color:#000;">🚨 持仓急救（总亏 {TOTAL_PNL:,} 元）</div>'
+        for p in POSITIONS:
+            html += f'<div style="font-size:13px;line-height:1.6;margin-bottom:4px;color:#000;">{p["name"]} <b>{p["dir"]}{p["lots"]}手</b> (均价{p["avg"]}) | 盈亏: {p["pnl"]:+}元</div>'
+        html += f'<div style="font-size:13px;color:#000;background:#fff;padding:8px;border-radius:4px;margin-top:8px;border:1px solid #ffcdd2;">'
+        html += f'<b>大白话建议：</b>你手里拿的是空单，如果上面的分析显示目前是“大牛市”或者“资金动能强”，赶紧逢高减仓，别死扛了！千万别逆着大趋势加仓。'
+        html += f'</div></div>'
+
+    html += f'<div style="color:#666;font-size:12px;text-align:center;margin-top:15px;">数据来源：新浪财经 & 腾讯财经 | 指标依据：MA、MACD、KDJ 综合判定</div>'
+    return html
+
+def main():
+    token = os.environ.get("PUSHPLUS_TOKEN")
+    if not token:
+        print("❌ 未在Secrets中配置PUSHPLUS_TOKEN")
+        return
+    content = build_html()
+    payload = {"token": token, "title": "期货深度盯盘（指标版）", "content": content, "template": "html"}
+    try:
+        resp = requests.post("https://www.pushplus.plus/send", json=payload, timeout=30)
+        result = resp.json()
+        if result.get("code") == 200:
+            print("✅ 推送成功")
+        else:
+            print(f"❌ 推送失败: {result.get('msg')}")
+    except Exception as e:
+        print(f"❌ 网络错误: {e}")
+
+if __name__ == "__main__":
+    main()
