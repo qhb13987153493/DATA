@@ -4,9 +4,9 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 
-# ================= 1. 你的账户核心数据（请确认） =================
+# ================= 你的账户核心数据 =================
 CAPITAL = 289485
-RISK_PER_TRADE = round(CAPITAL * 0.01) # 单笔风控上限：约 2895 元
+RISK_PER_TRADE = round(CAPITAL * 0.01)
 POSITIONS = [
     {"name": "甲醇", "code": "2701", "dir": "空", "lots": 7, "avg": 2889.43},
     {"name": "甲醇", "code": "2701", "dir": "多", "lots": 2, "avg": 3051.50},
@@ -16,7 +16,6 @@ MULTIPLIER = {"甲醇": 10, "PVC": 5, "白糖": 10}
 DATA_FILE = "kline_data.json"
 # ====================================================
 
-# ================= 2. 数据获取模块 =================
 def get_realtime_quotes():
     symbols = {"甲醇": "nf_MA2701", "PVC": "nf_V2701", "白糖": "nf_SR2701", "焦煤": "nf_JM2701"}
     url = "http://hq.sinajs.cn/list=" + ",".join(symbols.values())
@@ -34,8 +33,7 @@ def get_realtime_quotes():
                 price = float(parts[8]) if parts[8] else float(parts[4])
                 pre_settle = float(parts[4]) if parts[4] else 1
                 pct = round((price - pre_settle) / pre_settle * 100, 2) if pre_settle != 0 else 0
-                # 新浪接口持仓量通常在 parts[13] 附近
-                oi = float(parts[13]) if parts[13] else 0 
+                oi = float(parts[13]) if len(parts)>13 and parts[13] else 0 
                 quotes.append({
                     "name": name, "code": code, "price": price, "pct": pct,
                     "open": float(parts[1]) if parts[1] else 0, 
@@ -61,11 +59,14 @@ def get_macro_data():
     except: pass
     return oil_pct, dxy_pct, vix_str
 
-# ================= 3. 自建库与多源K线 =================
 def update_history(name, code, price, high, low, oi):
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f: history = json.load(f)
-    else: history = {}
+    try:
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, "r") as f: history = json.load(f)
+        else: history = {}
+    except:
+        history = {}
+        
     key = f"{name}_{code}"
     if key not in history: history[key] = []
     today = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -75,7 +76,10 @@ def update_history(name, code, price, high, low, oi):
             row["close"] = price; row["high"] = max(row.get("high", price), high); row["low"] = min(row.get("low", price), low); row["oi"] = oi
             updated = True; break
     if not updated: history[key].append({"date": today, "close": price, "high": high, "low": low, "oi": oi})
-    with open(DATA_FILE, "w") as f: json.dump(history, f)
+    
+    try:
+        with open(DATA_FILE, "w") as f: json.dump(history, f)
+    except: pass
     return history[key]
 
 def fetch_kline_data(name, code, period="day"):
@@ -88,48 +92,45 @@ def fetch_kline_data(name, code, period="day"):
         return [{'close': float(k[2]), 'high': float(k[3]), 'low': float(k[4])} for k in res['data'][symbol_tx][period]]
     except: return None
 
-# ================= 4. 核心交易分析逻辑 =================
 def get_tech_analysis(q):
-    name, code = q["name"], q["code"]
-    price, high, low, open_p, pre_settle, oi = q["price"], q["high"], q["low"], q["open"], q["pre_settle"], q["oi"]
-    
-    data_d = fetch_kline_data(name, code, "day")
-    data_60 = fetch_kline_data(name, code, "m60")
-    
-    stop_loss, action_plan, order_type = 0, "", "观望"
-    source_label = "历史数据"
-    diff = (high - low) if high > low else price * 0.01
-    atr = diff / 2
-
-    # 量仓诊断
-    if price > open_p and oi > 0: vol_price_state = "增仓上涨"
-    elif price < open_p and oi > 0: vol_price_state = "增仓下跌"
-    elif price > open_p and oi == 0: vol_price_state = "减仓上涨"
-    else: vol_price_state = "减仓下跌"
-
-    # 跳空缺口风控
-    gap_pct = abs(open_p - pre_settle) / pre_settle * 100 if pre_settle > 0 else 0
-    
-    if not data_d:
-        history_list = update_history(name, code, price, high, low, oi)
-        if len(history_list) < 20:
-            source_label = f"自建库({len(history_list)}/20)"
-            if gap_pct > 1.5:
-                return "极端跳空", "开盘偏离昨结超1.5%，情绪异常。", vol_price_state, "未知", source_label, "🛑 情绪盘，停止挂单。", "观望", price, 0
-            elif price >= low + diff * 0.7 and price > open_p: 
-                stage, desc = "多头中期(日内)", "日内多头占优。"; order_type = "做多"; stop_loss = low - (atr * 0.3)
-                action_plan = f"🛑 轻仓试多：现价 <b>{price}</b>。<br>🚫 止损：<b>{stop_loss:.0f}</b>。"
-            elif price <= low + diff * 0.3 and price < open_p: 
-                stage, desc = "空头中期(日内)", "日内空头占优。"; order_type = "做空"; stop_loss = high + (atr * 0.3)
-                action_plan = f"🛑 轻仓试空：现价 <b>{price}</b>。<br>🚫 止损：<b>{stop_loss:.0f}</b>。"
-            else: 
-                stage, desc, order_type, stop_loss = "观望", "卡在中间。", "观望", 0
-                action_plan = f"🛑 多看少动。"
-            return stage, desc, vol_price_state, "日内波动", source_label, action_plan, order_type, price, stop_loss
-        else:
-            data_d = history_list; source_label = "自建库"
-
     try:
+        name, code = q["name"], q["code"]
+        price, high, low, open_p, pre_settle, oi = q["price"], q["high"], q["low"], q["open"], q["pre_settle"], q["oi"]
+        
+        data_d = fetch_kline_data(name, code, "day")
+        data_60 = fetch_kline_data(name, code, "m60")
+        
+        stop_loss, action_plan, order_type = 0, "", "观望"
+        source_label = "历史数据"
+        diff = (high - low) if high > low else price * 0.01
+        atr = diff / 2
+
+        if price > open_p and oi > 0: vol_price_state = "增仓上涨"
+        elif price < open_p and oi > 0: vol_price_state = "增仓下跌"
+        elif price > open_p and oi == 0: vol_price_state = "减仓上涨"
+        else: vol_price_state = "减仓下跌"
+
+        gap_pct = abs(open_p - pre_settle) / pre_settle * 100 if pre_settle > 0 else 0
+        
+        if not data_d:
+            history_list = update_history(name, code, price, high, low, oi)
+            if len(history_list) < 20:
+                source_label = f"自建库({len(history_list)}/20)"
+                if gap_pct > 1.5:
+                    return "极端跳空", "开盘偏离昨结超1.5%，情绪异常。", vol_price_state, "未知", source_label, "🛑 情绪盘，停止挂单。", "观望", price, 0
+                elif price >= low + diff * 0.7 and price > open_p: 
+                    stage, desc = "多头中期(日内)", "日内多头占优。"; order_type = "做多"; stop_loss = low - (atr * 0.3)
+                    action_plan = f"🛑 轻仓试多：现价 <b>{price}</b>。<br>🚫 止损：<b>{stop_loss:.0f}</b>。"
+                elif price <= low + diff * 0.3 and price < open_p: 
+                    stage, desc = "空头中期(日内)", "日内空头占优。"; order_type = "做空"; stop_loss = high + (atr * 0.3)
+                    action_plan = f"🛑 轻仓试空：现价 <b>{price}</b>。<br>🚫 止损：<b>{stop_loss:.0f}</b>。"
+                else: 
+                    stage, desc, order_type, stop_loss = "观望", "卡在中间。", "观望", 0
+                    action_plan = f"🛑 多看少动。"
+                return stage, desc, vol_price_state, "日内波动", source_label, action_plan, order_type, price, stop_loss
+            else:
+                data_d = history_list; source_label = "自建库"
+
         df = pd.DataFrame(data_d)
         df['MA20'] = df['close'].rolling(window=20).mean(); df['MA60'] = df['close'].rolling(window=60).mean()
         df['std'] = df['close'].rolling(window=20).std()
@@ -149,20 +150,20 @@ def get_tech_analysis(q):
         upper, lower = last['upper'] if not pd.isna(last['upper']) else price*2, last['lower'] if not pd.isna(last['lower']) else price*0.5
         filter_band = atr * 0.3
 
-        # 60分钟共振过滤
         m60_overbought = False
         if data_60:
-            df60 = pd.DataFrame(data_60)
-            low60 = df60['low'].rolling(window=9).min(); high60 = df60['high'].rolling(window=9).max()
-            rsv60 = (df60['close'] - low60) / (high60 - low60) * 100
-            k60 = rsv60.ewm(com=2, adjust=False).mean(); d60 = k60.ewm(com=2, adjust=False).mean()
-            j60 = (3 * k60 - 2 * d60).iloc[-1]
-            if j60 > 90: m60_overbought = True
+            try:
+                df60 = pd.DataFrame(data_60)
+                low60 = df60['low'].rolling(window=9).min(); high60 = df60['high'].rolling(window=9).max()
+                rsv60 = (df60['close'] - low60) / (high60 - low60) * 100
+                k60 = rsv60.ewm(com=2, adjust=False).mean(); d60 = k60.ewm(com=2, adjust=False).mean()
+                j60 = (3 * k60 - 2 * d60).iloc[-1]
+                if j60 > 90: m60_overbought = True
+            except: pass
 
         if gap_pct > 1.5:
             stage, desc, order_type, stop_loss = "极端跳空", "开盘跳空超1.5%，原指标失效。", "观望", 0
             action_plan = f"🛑 等待缺口回补，或站稳均线（{ma20:.0f}）再操作。"
-
         elif last['close'] > ma20 and ma20 > ma60:
             if vol_price_state == "减仓上涨":
                 stage, desc, order_type, stop_loss = "多头陷阱", "价格在涨，但持仓量在减！虚涨，严禁追多！", "观望", 0
@@ -181,7 +182,6 @@ def get_tech_analysis(q):
                 stop_loss = ma20 - (atr * 1.0)
                 buy_point = max(ma20 + filter_band, price)
                 action_plan = f"🚀 顺势做多：站稳 <b>{buy_point:.0f}</b> 加 1 手多。<br>🚫 止损：<b>{stop_loss:.0f}</b>。"
-        
         elif last['close'] < ma20 and ma20 < ma60:
             if vol_price_state == "减仓下跌":
                 stage, desc, order_type, stop_loss = "空头陷阱", "价格在跌，但持仓量在减！虚跌，严禁追空！", "观望", 0
@@ -205,29 +205,28 @@ def get_tech_analysis(q):
         kdj = f"J值{last['J']:.0f}，" + ("严重超买。" if last['J']>80 else ("严重超卖。" if last['J']<20 else "情绪正常。"))
         
         action_plan += f"<br>🏃 <b>加仓与保本：</b>盈利超1倍ATR({atr*1.0:.0f}点)，推保本；盈利超2倍ATR，推移动止损。"
-
         return stage, desc, vol_price_state, kdj, source_label, action_plan, order_type, price, stop_loss
     except Exception as e:
-        return "观望", "解析异常。", "未知", "未知", "报错", "观望为主。", "观望", price, 0
+        return "观望", "解析异常。", "未知", "未知", "报错", "观望为主。", "观望", q.get("price", 0), 0
 
-# ================= 5. 持仓急救逻辑 =================
 def get_position_advice(pos, current_price):
-    dir_str = pos['dir']
-    mult = MULTIPLIER.get(pos['name'], 10)
-    pnl = (current_price - pos['avg']) * pos['lots'] * mult if dir_str == "多" else (pos['avg'] - current_price) * pos['lots'] * mult
-    
-    slip_pt = 3 # 防扫损滑点
-    if pnl < 0:
-        if dir_str == "空":
-            cut_price = current_price + (pos['avg'] - current_price) * 0.5 
-            return f"⚠️ 浮亏 {int(pnl)}元。反弹到 <b>{cut_price:.0f}</b> 附近必须减半仓。软件设条件单时，止损价多填 <b>{slip_pt}</b> 个点，防扫损。"
+    try:
+        dir_str = pos['dir']
+        mult = MULTIPLIER.get(pos['name'], 10)
+        pnl = (current_price - pos['avg']) * pos['lots'] * mult if dir_str == "多" else (pos['avg'] - current_price) * pos['lots'] * mult
+        
+        slip_pt = 3
+        if pnl < 0:
+            if dir_str == "空":
+                cut_price = current_price + (pos['avg'] - current_price) * 0.5 
+                return f"⚠️ 浮亏 {int(pnl)}元。反弹到 <b>{cut_price:.0f}</b> 附近必须减半仓。条件单止损多填 <b>{slip_pt}</b> 个点防扫损。"
+            else:
+                cut_price = current_price - (current_price - pos['avg']) * 0.5
+                return f"⚠️ 浮亏 {int(pnl)}元。跌破 <b>{cut_price:.0f}</b> 附近必须减半仓。条件单止损多填 <b>{slip_pt}</b> 个点防扫损。"
         else:
-            cut_price = current_price - (current_price - pos['avg']) * 0.5
-            return f"⚠️ 浮亏 {int(pnl)}元。跌破 <b>{cut_price:.0f}</b> 附近必须减半仓。软件设条件单时，止损价多填 <b>{slip_pt}</b> 个点，防扫损。"
-    else:
-        return f"✅ 浮盈 {int(pnl)}元。**保本铁律**：立刻将止损推到开仓价 {pos['avg']}（加 {slip_pt} 个点缓冲），让利润奔跑！"
+            return f"✅ 浮盈 {int(pnl)}元。**保本铁律**：立刻将止损推到开仓价 {pos['avg']}（加 {slip_pt} 个点缓冲）。"
+    except: return "计算异常"
 
-# ================= 6. HTML 生成与推送 =================
 def build_html():
     now = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime('%m-%d %H:%M')
     quotes = get_realtime_quotes()
@@ -240,21 +239,18 @@ def build_html():
     html = f'<div style="font-family:-apple-system,sans-serif;max-width:600px;color:#000;font-size:14px;">'
     html += f'<div style="background:linear-gradient(135deg,#1a3c6e,#2b5aa0);color:#fff;text-align:center;padding:12px;border-radius:8px;font-size:16px;font-weight:bold;">顶级期货实战指令<br><span style="font-size:12px;">{now} | 权益:{CAPITAL:,}</span></div>'
 
-    # 换月警告
     month = datetime.datetime.now().month
     if month in [11, 12]:
         html += f'<div style="background:#ffebee;border:2px solid #d32f2f;border-radius:6px;padding:10px;margin:10px 0;font-size:14px;text-align:center;color:#b71c1c;font-weight:bold;">'
-        html += f'🚨 <b>时间警报：01 合约即将交割！</b><br>'
-        html += f'主力正在移仓换月，流动性骤降，极易假突破，严禁开新仓！'
+        html += f'🚨 <b>时间警报：01 合约即将交割！</b><br>主力正在移仓换月，流动性骤降，极易假突破，严禁开新仓！'
         html += f'</div>'
 
-    # 宏观面板
     html += f'<div style="background:#f5f7fa;border:1px solid #d9d9d9;border-radius:6px;padding:8px;margin:10px 0;font-size:13px;text-align:center;color:#000;">'
     html += f'🌍 <b>VIX：</b>{vix_str} ｜ 🛢️ <b>WTI：</b>{oil_pct:+.2f}% ｜ 💵 <b>美元：</b>{dxy_pct:+.2f}%'
     if coking_coal:
-        html += f'<br>⛏️ <b>焦煤(煤化工风向标)：</b>{coking_coal["pct"]:+.2f}%'
+        html += f'<br>⛏️ <b>焦煤：</b>{coking_coal["pct"]:+.2f}%'
     if dxy_pct > 0.5 or (coking_coal and coking_coal["pct"] < -2.0):
-        html += f'<span style="color:#d32f2f;font-weight:bold;font-size:12px;"> ⚠️ 宏观利空扰动，谨慎做多！</span>'
+        html += f'<span style="color:#d32f2f;font-weight:bold;font-size:12px;"> ⚠️ 宏观利空扰动！</span>'
     html += f'</div>'
 
     analysis_results = []
@@ -271,14 +267,12 @@ def build_html():
         html += f'<div style="font-size:16px; font-weight:bold; margin-bottom:8px; border-bottom:1px dashed #ccc; padding-bottom:6px;">'
         html += f'{q["name"]} {q["code"]}：<span style="font-size:20px;">{q["price"]}</span> ({q["pct"]:+.2f}%)<span style="font-size:10px; color:#888; float:right;">{source_label}</span></div>'
         
-        # 极端行情涨停警告
         if abs(q["pct"]) > 6.0:  
-            html += f'<div style="background:#d32f2f;color:#fff;padding:6px;border-radius:4px;margin-bottom:8px;font-size:12px;font-weight:bold;">🚨 极端行情：涨跌幅超 6%，随时封板！禁止追单！</div>'
+            html += f'<div style="background:#d32f2f;color:#fff;padding:6px;border-radius:4px;margin-bottom:8px;font-size:12px;font-weight:bold;">🚨 极端行情：涨跌幅超 6%！禁止追单！</div>'
 
         html += f'<div style="font-size:14px; line-height:1.7;">👉 <b>阶段：</b>{stage}<br>💬 <b>趋势：</b>{trend_desc}<br>🔥 <b>动能/量仓：</b>{macd_desc}<br>🌡️ <b>温度：</b>{kdj_desc}<br>'
         html += f'<div style="background:#fff; border:2px solid {border_color}; padding:10px; border-radius:6px; margin-top:10px;"><div style="font-weight:bold; color:{border_color};">🎯 指令：</div>{action_plan}</div></div></div>'
 
-    # 仓位阶梯
     html += f'<div style="background:#e3f2fd;border-left:4px solid #1e88e5;border-radius:6px;padding:12px;margin:15px 0 10px 0;">'
     html += f'<div style="font-size:16px;font-weight:bold;margin-bottom:6px;color:#000;">🛡️ 仓位控制 (死亏上限 {RISK_PER_TRADE}元)</div>'
     for res in analysis_results:
@@ -291,7 +285,6 @@ def build_html():
             html += f'<div style="font-size:13px;color:#000;background:#fff;padding:6px;margin-bottom:4px;border-radius:4px;"><b>{q["name"]} ({res["order_type"]})</b>：{res["buy"]:.0f}进场，{res["stop"]:.0f}止损。1手亏{money:.0f}元。最多<b>{max_l}手</b>，首仓<b>{first_l}手</b>。</div>'
     html += f'</div>'
 
-    # 持仓急救与诊断
     if POSITIONS:
         html += f'<div style="background:#ffebee;border-left:4px solid #d32f2f;border-radius:6px;padding:12px;margin:10px 0;">'
         html += f'<div style="font-size:16px;font-weight:bold;margin-bottom:8px;color:#000;">🚨 持仓真实急救</div>'
@@ -303,15 +296,12 @@ def build_html():
                 html += f'<b>{p["name"]} {p["dir"]}{p["lots"]}手</b>：{advice}</div>'
         
         html += f'<div style="font-size:12px;color:#b71c1c;background:#fff3f3;padding:8px;border-radius:4px;margin-top:8px;border:1px solid #ffcdd2;line-height:1.5;">'
-        html += f'🔍 <b>账户敞口诊断：</b>当前持仓高度集中在【能化板块】。若原油异动，面临板块单边双杀风险。切忌同向开仓！'
-        html += f'</div>'
-        html += f'</div>'
+        html += f'🔍 <b>敞口诊断：</b>当前持仓高度集中在【能化板块】。面临板块单边双杀风险，切忌同向开仓！'
+        html += f'</div></div>'
 
-    # 情绪熔断
     html += f'<div style="border-top:1px dashed #999; margin-top:15px; padding-top:10px; font-size:12px; color:#555; line-height:1.5;">'
-    html += f'💡 <b>情绪熔断提醒：</b>如果你最近三天累计亏损超过 {int(CAPITAL * 0.03):,} 元，说明当前行情不适合你的节奏。请强制空仓休息一天，严禁报复性交易！'
-    html += f'</div>'
-    html += f'</div>'
+    html += f'💡 <b>情绪熔断：</b>如果近三天累计亏损超 {int(CAPITAL * 0.03):,} 元，强制空仓休息一天，严禁报复性交易！'
+    html += f'</div></div>'
     
     return html
 
