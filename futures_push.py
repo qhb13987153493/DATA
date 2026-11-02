@@ -5,7 +5,7 @@ import numpy as np
 
 # ================= 你的账户核心数据 =================
 CAPITAL = 289485
-RISK_PER_TRADE = round(CAPITAL * 0.01)
+RISK_PER_TRADE = round(CAPITAL * 0.01) # 单笔风控上限：约 2895 元
 POSITIONS = [
     {"name": "甲醇", "code": "2701", "dir": "空", "lots": 7, "avg": 2889.43},
     {"name": "甲醇", "code": "2701", "dir": "多", "lots": 2, "avg": 3051.50},
@@ -16,7 +16,7 @@ DATA_FILE = "kline_data.json"
 # ====================================================
 
 def get_realtime_quotes():
-    # 加入了 原油 和 美元指数 (新浪代码)
+    # 加入了 原油 和 焦煤 作为宏观风向标
     symbols = {"甲醇": "nf_MA2701", "PVC": "nf_V2701", "白糖": "nf_SR2701", "焦煤": "nf_JM2701", "原油": "nf_SC2701"}
     url = "http://hq.sinajs.cn/list=" + ",".join(symbols.values())
     headers = {"Referer": "http://finance.sina.com.cn"}
@@ -68,7 +68,7 @@ def update_history(name, code, price, high, low, oi):
     return history[key]
 
 def fetch_kline_data(name, code, period="day"):
-    prefix = {"甲醇": "MA", "PVC": "V", "白糖": "SR"}.get(name, "")
+    prefix = {"甲醇": "MA", "PVC": "V", "白糖": "SR", "原油": "SC", "焦煤": "JM"}.get(name, "")
     symbol_tx = f"{prefix}{code}"
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
@@ -90,19 +90,21 @@ def get_tech_analysis(q):
         diff = (high - low) if high > low else price * 0.01
         atr = diff / 2
 
+        # 量仓诊断
         if price > open_p and oi > 0: vol_price_state = "增仓上涨"
         elif price < open_p and oi > 0: vol_price_state = "增仓下跌"
         elif price > open_p and oi == 0: vol_price_state = "减仓上涨"
         else: vol_price_state = "减仓下跌"
 
+        # 放宽跳空阈值到 3.0%
         gap_pct = abs(open_p - pre_settle) / pre_settle * 100 if pre_settle > 0 else 0
         
         if not data_d:
             history_list = update_history(name, code, price, high, low, oi)
             if len(history_list) < 20:
                 source_label = f"自建库({len(history_list)}/20)"
-                if gap_pct > 1.5:
-                    return "极端跳空", "开盘偏离昨结超1.5%，情绪异常。", vol_price_state, "未知", source_label, "🛑 情绪盘，停止挂单。", "观望", price, 0
+                if gap_pct > 3.0:
+                    return "极端跳空", "开盘偏离昨结超3%，情绪异常。", vol_price_state, "未知", source_label, "🛑 情绪盘，停止挂单。", "观望", price, 0
                 elif price >= low + diff * 0.7 and price > open_p: 
                     stage, desc = "多头中期(日内)", "日内多头占优。"; order_type = "做多"; stop_loss = low - (atr * 0.3)
                     action_plan = f"🛑 轻仓试多：现价 <b>{price}</b>。<br>🚫 止损：<b>{stop_loss:.0f}</b>。"
@@ -135,6 +137,7 @@ def get_tech_analysis(q):
         upper, lower = last['upper'] if not pd.isna(last['upper']) else price*2, last['lower'] if not pd.isna(last['lower']) else price*0.5
         filter_band = atr * 0.3
 
+        # 60分钟共振过滤
         m60_overbought = False
         if data_60:
             try:
@@ -146,8 +149,8 @@ def get_tech_analysis(q):
                 if j60 > 90: m60_overbought = True
             except: pass
 
-        if gap_pct > 1.5:
-            stage, desc, order_type, stop_loss = "极端跳空", "开盘跳空超1.5%，原指标失效。", "观望", 0
+        if gap_pct > 3.0:
+            stage, desc, order_type, stop_loss = "极端跳空", "开盘跳空超3%，原指标失效。", "观望", 0
             action_plan = f"🛑 等待缺口回补，或站稳均线（{ma20:.0f}）再操作。"
         elif last['close'] > ma20 and ma20 > ma60:
             if vol_price_state == "减仓上涨":
@@ -217,11 +220,9 @@ def build_html():
     now = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime('%m-%d %H:%M')
     quotes = get_realtime_quotes()
     
-    # 提取宏观品种
     oil_quote = next((q for q in quotes if q["name"] == "原油"), None)
     coking_coal = next((q for q in quotes if q["name"] == "焦煤"), None)
     
-    # 剔除宏观品种，只留核心交易品种
     main_quotes = [q for q in quotes if q["name"] not in ["原油", "焦煤"]]
     price_dict = {q["name"]: q["price"] for q in main_quotes}
 
