@@ -13,7 +13,7 @@ TOTAL_PNL = -42055
 MULTIPLIER = {"甲醇": 10, "PVC": 5, "白糖": 10}
 # ====================================================
 
-# 获取实时期货价格
+# 获取实时期货价格 (保持新浪)
 def get_realtime_quotes():
     symbols = {"甲醇": "nf_MA2701", "PVC": "nf_V2701", "白糖": "nf_SR2701"}
     url = "http://hq.sinajs.cn/list=" + ",".join(symbols.values())
@@ -36,19 +36,28 @@ def get_realtime_quotes():
     except Exception as e:
         return []
 
-# 获取历史K线并计算MACD、KDJ、均线 (使用腾讯接口)
+# 获取历史K线并计算指标 (使用腾讯接口)
 def get_tech_analysis(name, code):
-    # 腾讯期货代码，例如 MA2701
-    symbol = f"{name}{code}"
-    # 腾讯日K线接口
-    url = f"https://web.ifzq.gtimg.cn/appstock/app/kline/kline?param={code},day,,,120"
+    # 腾讯期货代码映射
+    prefix_map = {"甲醇": "MA", "PVC": "V", "白糖": "SR"}
+    symbol = f"{prefix_map.get(name, '')}{code}"
+    url = f"https://web.ifzq.gtimg.cn/appstock/app/kline/kline?param={symbol},day,,,120"
+    
+    headers = {"User-Agent": "Mozilla/5.0"}
     
     try:
-        res = requests.get(url, timeout=10).json()
-        klines = res['data'][code]['day']
+        res = requests.get(url, headers=headers, timeout=10).json()
+        data_dict = res.get('data', {})
+        
+        # 腾讯的返回结构比较深，需要层层提取
+        if not data_dict or symbol not in data_dict or 'day' not in data_dict[symbol]:
+            raise ValueError("腾讯接口未返回该品种的K线")
+            
+        klines = data_dict[symbol]['day']
         
         data = []
         for k in klines:
+            # 腾讯格式: [日期, 开, 收, 高, 低, 量]
             data.append({
                 'close': float(k[2]),
                 'high': float(k[3]),
@@ -57,18 +66,18 @@ def get_tech_analysis(name, code):
             
         df = pd.DataFrame(data)
         
-        # 1. 计算均线 (MA20, MA60)
+        # 计算均线
         df['MA20'] = df['close'].rolling(window=20).mean()
         df['MA60'] = df['close'].rolling(window=60).mean()
         
-        # 2. 计算 MACD (12, 26, 9)
+        # 计算 MACD
         exp1 = df['close'].ewm(span=12, adjust=False).mean()
         exp2 = df['close'].ewm(span=26, adjust=False).mean()
         df['DIFF'] = exp1 - exp2
         df['DEA'] = df['DIFF'].ewm(span=9, adjust=False).mean()
         df['MACD'] = (df['DIFF'] - df['DEA']) * 2
         
-        # 3. 计算 KDJ (9, 3, 3)
+        # 计算 KDJ
         low_min = df['low'].rolling(window=9).min()
         high_max = df['high'].rolling(window=9).max()
         rsv = (df['close'] - low_min) / (high_max - low_min) * 100
@@ -113,7 +122,7 @@ def get_tech_analysis(name, code):
             
         return trend_stage, trend_desc, macd_momentum, kdj_momentum
     except Exception as e:
-        print(f"获取 {name} 数据失败: {e}")
+        print(f"解析 {name} 数据失败: {e}")
         return "日内震荡", "历史数据暂不可用，纯看日内表现。", "动能未明", "短线温度未知"
 
 def build_html():
