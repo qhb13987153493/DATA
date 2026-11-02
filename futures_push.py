@@ -2,7 +2,6 @@
 import os, json, requests, datetime
 import pandas as pd
 import numpy as np
-import yfinance as yf
 
 # ================= 你的账户核心数据 =================
 CAPITAL = 289485
@@ -17,7 +16,8 @@ DATA_FILE = "kline_data.json"
 # ====================================================
 
 def get_realtime_quotes():
-    symbols = {"甲醇": "nf_MA2701", "PVC": "nf_V2701", "白糖": "nf_SR2701", "焦煤": "nf_JM2701"}
+    # 加入了 原油 和 美元指数 (新浪代码)
+    symbols = {"甲醇": "nf_MA2701", "PVC": "nf_V2701", "白糖": "nf_SR2701", "焦煤": "nf_JM2701", "原油": "nf_SC2701"}
     url = "http://hq.sinajs.cn/list=" + ",".join(symbols.values())
     headers = {"Referer": "http://finance.sina.com.cn"}
     try:
@@ -43,21 +43,6 @@ def get_realtime_quotes():
                 })
         return quotes
     except: return []
-
-def get_macro_data():
-    oil_pct, dxy_pct, vix_str = 0, 0, "获取失败"
-    try:
-        oil_data = yf.Ticker("CL=F").history(period="2d")
-        if len(oil_data) >= 2: oil_pct = round((oil_data['Close'].iloc[-1] - oil_data['Close'].iloc[-2]) / oil_data['Close'].iloc[-2] * 100, 2)
-        dxy_data = yf.Ticker("DX-Y.NYB").history(period="2d")
-        if len(dxy_data) >= 2: dxy_pct = round((dxy_data['Close'].iloc[-1] - dxy_data['Close'].iloc[-2]) / dxy_data['Close'].iloc[-2] * 100, 2)
-        vix_data = yf.Ticker("^VIX").history(period="2d")
-        if len(vix_data) >= 2: 
-            vix_last = vix_data['Close'].iloc[-1]
-            vix_prev = vix_data['Close'].iloc[-2]
-            vix_str = f"{vix_last:.2f} ({round((vix_last - vix_prev) / vix_prev * 100, 2):+.2f}%)"
-    except: pass
-    return oil_pct, dxy_pct, vix_str
 
 def update_history(name, code, price, high, low, oi):
     try:
@@ -207,6 +192,7 @@ def get_tech_analysis(q):
         action_plan += f"<br>🏃 <b>加仓与保本：</b>盈利超1倍ATR({atr*1.0:.0f}点)，推保本；盈利超2倍ATR，推移动止损。"
         return stage, desc, vol_price_state, kdj, source_label, action_plan, order_type, price, stop_loss
     except Exception as e:
+        print(f"Error analyzing {q.get('name')}: {e}")
         return "观望", "解析异常。", "未知", "未知", "报错", "观望为主。", "观望", q.get("price", 0), 0
 
 def get_position_advice(pos, current_price):
@@ -230,10 +216,13 @@ def get_position_advice(pos, current_price):
 def build_html():
     now = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime('%m-%d %H:%M')
     quotes = get_realtime_quotes()
-    oil_pct, dxy_pct, vix_str = get_macro_data()
     
+    # 提取宏观品种
+    oil_quote = next((q for q in quotes if q["name"] == "原油"), None)
     coking_coal = next((q for q in quotes if q["name"] == "焦煤"), None)
-    main_quotes = [q for q in quotes if q["name"] != "焦煤"]
+    
+    # 剔除宏观品种，只留核心交易品种
+    main_quotes = [q for q in quotes if q["name"] not in ["原油", "焦煤"]]
     price_dict = {q["name"]: q["price"] for q in main_quotes}
 
     html = f'<div style="font-family:-apple-system,sans-serif;max-width:600px;color:#000;font-size:14px;">'
@@ -246,11 +235,14 @@ def build_html():
         html += f'</div>'
 
     html += f'<div style="background:#f5f7fa;border:1px solid #d9d9d9;border-radius:6px;padding:8px;margin:10px 0;font-size:13px;text-align:center;color:#000;">'
-    html += f'🌍 <b>VIX：</b>{vix_str} ｜ 🛢️ <b>WTI：</b>{oil_pct:+.2f}% ｜ 💵 <b>美元：</b>{dxy_pct:+.2f}%'
+    if oil_quote:
+        oil_color = "#b71c1c" if oil_quote["pct"] > 0 else "#1b5e20"
+        html += f'🛢️ <b>原油：</b><span style="color:{oil_color};font-weight:bold;">{oil_quote["pct"]:+.2f}%</span>'
     if coking_coal:
-        html += f'<br>⛏️ <b>焦煤：</b>{coking_coal["pct"]:+.2f}%'
-    if dxy_pct > 0.5 or (coking_coal and coking_coal["pct"] < -2.0):
-        html += f'<span style="color:#d32f2f;font-weight:bold;font-size:12px;"> ⚠️ 宏观利空扰动！</span>'
+        coal_color = "#b71c1c" if coking_coal["pct"] > 0 else "#1b5e20"
+        html += f' ｜ ⛏️ <b>焦煤：</b><span style="color:{coal_color};font-weight:bold;">{coking_coal["pct"]:+.2f}%</span>'
+    if oil_quote and (oil_quote["pct"] > 2.0 or oil_quote["pct"] < -2.0):
+        html += f'<br><span style="color:#d32f2f;font-weight:bold;font-size:12px;"> ⚠️ 原油异动剧烈，化工品风险放大！</span>'
     html += f'</div>'
 
     analysis_results = []
