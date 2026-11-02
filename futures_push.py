@@ -1,7 +1,6 @@
 # encoding:utf-8
 import os, json, requests, datetime
 import pandas as pd
-import akshare as ak
 
 # ================= 你的账户核心数据 =================
 CAPITAL = 289485
@@ -14,7 +13,7 @@ TOTAL_PNL = -42055
 MULTIPLIER = {"甲醇": 10, "PVC": 5, "白糖": 10}
 # ====================================================
 
-# 获取实时期货价格（保持不变）
+# 获取实时期货价格
 def get_realtime_quotes():
     symbols = {"甲醇": "nf_MA2701", "PVC": "nf_V2701", "白糖": "nf_SR2701"}
     url = "http://hq.sinajs.cn/list=" + ",".join(symbols.values())
@@ -34,21 +33,35 @@ def get_realtime_quotes():
                 color = "#b71c1c" if pct >= 0 else "#1b5e20"
                 quotes.append({"name": name, "code": code, "price": price, "pct": pct, "color": color})
         return quotes
-    except:
+    except Exception as e:
         return []
 
-# 修复核心：使用 AkShare 获取历史日K线
+# 获取历史K线并计算MACD、KDJ、均线 (使用东方财富接口)
 def get_tech_analysis(name, code):
-    try:
-        # AkShare 获取期货日线数据，格式：MA2701
-        symbol = f"{name}{code}"
-        df = ak.futures_zh_daily_sina(symbol=symbol)
+    # 东财交易所代码：郑商所115，大商所114
+    if name in ["甲醇", "白糖"]:
+        secid = f"115.{code}"
+    else:
+        secid = f"114.{code}"
         
-        # 截取最近120个交易日，保证有足够数据计算指标
-        df = df.tail(120).reset_index(drop=True)
-        df['close'] = df['close'].astype(float)
-        df['high'] = df['high'].astype(float)
-        df['low'] = df['low'].astype(float)
+    url = f"https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={secid}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58&klt=101&fqt=0&end=20500101&lmt=120"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    
+    try:
+        res = requests.get(url, headers=headers, timeout=10).json()
+        klines = res['data']['klines']
+        
+        data = []
+        for k in klines:
+            # 格式: "日期,开盘,收盘,最高,最低,成交量..."
+            parts = k.split(',')
+            data.append({
+                'close': float(parts[2]),
+                'high': float(parts[3]),
+                'low': float(parts[4])
+            })
+            
+        df = pd.DataFrame(data)
         
         # 1. 计算均线 (MA20, MA60)
         df['MA20'] = df['close'].rolling(window=20).mean()
@@ -106,9 +119,8 @@ def get_tech_analysis(name, code):
             
         return trend_stage, trend_desc, macd_momentum, kdj_momentum
     except Exception as e:
-        # 如果还是报错，把错误信息打印出来方便排查
         print(f"获取 {name} 数据失败: {e}")
-        return "分析失败", "K线数据获取异常", "请稍后再试", "请稍后再试"
+        return "数据异常", "接口暂不可用", "请稍后再试", "请稍后再试"
 
 def build_html():
     now = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime('%m-%d %H:%M')
@@ -142,7 +154,6 @@ def build_html():
         html += f'🌡️ <b>短线温度：</b>{kdj_desc}'
         html += f'</div></div>'
 
-    # 资金阶梯和持仓部分保持不变...
     html += f'<div style="background:#fff3e0;border-left:4px solid #f57c00;border-radius:6px;padding:12px;margin:15px 0 10px 0;">'
     html += f'<div style="font-size:16px;font-weight:bold;margin-bottom:8px;color:#000;">💰 资金阶梯分配表</div>'
     for q in quotes:
@@ -166,7 +177,7 @@ def build_html():
         html += f'<b>大白话建议：</b>你手里拿的是空单，如果上面的分析显示目前是“大牛市”或者“资金动能强”，赶紧逢高减仓，别死扛了！千万别逆着大趋势加仓。'
         html += f'</div></div>'
 
-    html += f'<div style="color:#666;font-size:12px;text-align:center;margin-top:15px;">数据来源：新浪财经 & AkShare | 指标依据：MA、MACD、KDJ 综合判定</div>'
+    html += f'<div style="color:#666;font-size:12px;text-align:center;margin-top:15px;">数据来源：东方财富 | 指标依据：MA、MACD、KDJ 综合判定</div>'
     return html
 
 def main():
