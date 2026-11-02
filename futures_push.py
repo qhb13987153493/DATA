@@ -4,19 +4,19 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 
-# ================= 你的账户核心数据 =================
+# ================= 1. 你的账户核心数据（请确认） =================
 CAPITAL = 289485
-RISK_PER_TRADE = round(CAPITAL * 0.01)
+RISK_PER_TRADE = round(CAPITAL * 0.01) # 单笔风控上限：约 2895 元
 POSITIONS = [
     {"name": "甲醇", "code": "2701", "dir": "空", "lots": 7, "avg": 2889.43},
     {"name": "甲醇", "code": "2701", "dir": "多", "lots": 2, "avg": 3051.50},
     {"name": "PVC", "code": "2701", "dir": "空", "lots": 13, "avg": 5096.46},
 ]
-TOTAL_PNL = -42055
 MULTIPLIER = {"甲醇": 10, "PVC": 5, "白糖": 10}
 DATA_FILE = "kline_data.json"
 # ====================================================
 
+# ================= 2. 数据获取模块 =================
 def get_realtime_quotes():
     symbols = {"甲醇": "nf_MA2701", "PVC": "nf_V2701", "白糖": "nf_SR2701", "焦煤": "nf_JM2701"}
     url = "http://hq.sinajs.cn/list=" + ",".join(symbols.values())
@@ -25,6 +25,7 @@ def get_realtime_quotes():
         data = requests.get(url, headers=headers, timeout=10).text
         quotes = []
         for line in data.strip().split('\n'):
+            if '"' not in line: continue
             parts = line.split('"')[1].split(',')
             if len(parts) > 14:
                 name_code = parts[0]
@@ -33,12 +34,14 @@ def get_realtime_quotes():
                 price = float(parts[8]) if parts[8] else float(parts[4])
                 pre_settle = float(parts[4]) if parts[4] else 1
                 pct = round((price - pre_settle) / pre_settle * 100, 2) if pre_settle != 0 else 0
+                # 新浪接口持仓量通常在 parts[13] 附近
+                oi = float(parts[13]) if parts[13] else 0 
                 quotes.append({
                     "name": name, "code": code, "price": price, "pct": pct,
                     "open": float(parts[1]) if parts[1] else 0, 
                     "high": max(float(parts[2]), float(parts[3])), 
                     "low": min(float(parts[2]), float(parts[3])),
-                    "oi": float(parts[13]) if parts[13] else 0
+                    "pre_settle": pre_settle, "oi": oi
                 })
         return quotes
     except: return []
@@ -51,11 +54,15 @@ def get_macro_data():
         dxy_data = yf.Ticker("DX-Y.NYB").history(period="2d")
         if len(dxy_data) >= 2: dxy_pct = round((dxy_data['Close'].iloc[-1] - dxy_data['Close'].iloc[-2]) / dxy_data['Close'].iloc[-2] * 100, 2)
         vix_data = yf.Ticker("^VIX").history(period="2d")
-        if len(vix_data) >= 2: vix_str = f"{vix_data['Close'].iloc[-1]:.2f} ({round((vix_data['Close'].iloc[-1] - vix_data['Close'].iloc[-2]) / vix_data['Close'].iloc[-2] * 100, 2):+.2f}%)"
+        if len(vix_data) >= 2: 
+            vix_last = vix_data['Close'].iloc[-1]
+            vix_prev = vix_data['Close'].iloc[-2]
+            vix_str = f"{vix_last:.2f} ({round((vix_last - vix_prev) / vix_prev * 100, 2):+.2f}%)"
     except: pass
     return oil_pct, dxy_pct, vix_str
 
-def update_history(name, code, price, high, low):
+# ================= 3. 自建库与多源K线 =================
+def update_history(name, code, price, high, low, oi):
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r") as f: history = json.load(f)
     else: history = {}
@@ -65,9 +72,9 @@ def update_history(name, code, price, high, low):
     updated = False
     for row in history[key]:
         if row["date"] == today:
-            row["close"] = price; row["high"] = max(row.get("high", price), high); row["low"] = min(row.get("low", price), low)
+            row["close"] = price; row["high"] = max(row.get("high", price), high); row["low"] = min(row.get("low", price), low); row["oi"] = oi
             updated = True; break
-    if not updated: history[key].append({"date": today, "close": price, "high": high, "low": low})
+    if not updated: history[key].append({"date": today, "close": price, "high": high, "low": low, "oi": oi})
     with open(DATA_FILE, "w") as f: json.dump(history, f)
     return history[key]
 
@@ -75,40 +82,50 @@ def fetch_kline_data(name, code, period="day"):
     prefix = {"甲醇": "MA", "PVC": "V", "白糖": "SR"}.get(name, "")
     symbol_tx = f"{prefix}{code}"
     headers = {"User-Agent": "Mozilla/5.0"}
-    
-    # 腾讯接口支持分钟线和日线
     try:
         url_tx = f"https://web.ifzq.gtimg.cn/appstock/app/kline/kline?param={symbol_tx},{period},,,120"
         res = requests.get(url_tx, headers=headers, timeout=5).json()
         return [{'close': float(k[2]), 'high': float(k[3]), 'low': float(k[4])} for k in res['data'][symbol_tx][period]]
     except: return None
 
+# ================= 4. 核心交易分析逻辑 =================
 def get_tech_analysis(q):
     name, code = q["name"], q["code"]
-    price, high, low, open_p = q["price"], q["high"], q["low"], q["open"]
+    price, high, low, open_p, pre_settle, oi = q["price"], q["high"], q["low"], q["open"], q["pre_settle"], q["oi"]
+    
     data_d = fetch_kline_data(name, code, "day")
-    data_60 = fetch_kline_data(name, code, "m60") # 60分钟线
+    data_60 = fetch_kline_data(name, code, "m60")
     
     stop_loss, action_plan, order_type = 0, "", "观望"
     source_label = "历史数据"
     diff = (high - low) if high > low else price * 0.01
     atr = diff / 2
 
+    # 量仓诊断
+    if price > open_p and oi > 0: vol_price_state = "增仓上涨"
+    elif price < open_p and oi > 0: vol_price_state = "增仓下跌"
+    elif price > open_p and oi == 0: vol_price_state = "减仓上涨"
+    else: vol_price_state = "减仓下跌"
+
+    # 跳空缺口风控
+    gap_pct = abs(open_p - pre_settle) / pre_settle * 100 if pre_settle > 0 else 0
+    
     if not data_d:
-        history_list = update_history(name, code, price, high, low)
+        history_list = update_history(name, code, price, high, low, oi)
         if len(history_list) < 20:
             source_label = f"自建库({len(history_list)}/20)"
-            amp = round(diff / low * 100, 2) if low > 0 else 0
-            if price >= low + diff * 0.7 and price > open_p: 
+            if gap_pct > 1.5:
+                return "极端跳空", "开盘偏离昨结超1.5%，情绪异常。", vol_price_state, "未知", source_label, "🛑 情绪盘，停止挂单。", "观望", price, 0
+            elif price >= low + diff * 0.7 and price > open_p: 
                 stage, desc = "多头中期(日内)", "日内多头占优。"; order_type = "做多"; stop_loss = low - (atr * 0.3)
                 action_plan = f"🛑 轻仓试多：现价 <b>{price}</b>。<br>🚫 止损：<b>{stop_loss:.0f}</b>。"
             elif price <= low + diff * 0.3 and price < open_p: 
                 stage, desc = "空头中期(日内)", "日内空头占优。"; order_type = "做空"; stop_loss = high + (atr * 0.3)
                 action_plan = f"🛑 轻仓试空：现价 <b>{price}</b>。<br>🚫 止损：<b>{stop_loss:.0f}</b>。"
             else: 
-                stage, desc = "观望", "卡在中间。"; order_type = "观望"; stop_loss = 0
+                stage, desc, order_type, stop_loss = "观望", "卡在中间。", "观望", 0
                 action_plan = f"🛑 多看少动。"
-            return stage, desc, "日内波动", "日内波动", source_label, action_plan, order_type, price, stop_loss
+            return stage, desc, vol_price_state, "日内波动", source_label, action_plan, order_type, price, stop_loss
         else:
             data_d = history_list; source_label = "自建库"
 
@@ -120,7 +137,8 @@ def get_tech_analysis(q):
         exp1 = df['close'].ewm(span=12, adjust=False).mean(); exp2 = df['close'].ewm(span=26, adjust=False).mean()
         df['DIFF'] = exp1 - exp2; df['DEA'] = df['DIFF'].ewm(span=9, adjust=False).mean(); df['MACD'] = (df['DIFF'] - df['DEA']) * 2
         df['TR'] = np.maximum(df['high'] - df['low'], np.maximum(abs(df['high'] - df['close'].shift()), abs(df['low'] - df['close'].shift())))
-        atr = df['TR'].rolling(window=14).mean().iloc[-1]
+        atr_val = df['TR'].rolling(window=14).mean().iloc[-1]
+        atr = atr_val if not pd.isna(atr_val) else atr
         
         low_min = df['low'].rolling(window=9).min(); high_max = df['high'].rolling(window=9).max()
         rsv = (df['close'] - low_min) / (high_max - low_min) * 100
@@ -129,73 +147,106 @@ def get_tech_analysis(q):
         last, prev = df.iloc[-1], df.iloc[-2]
         ma20, ma60 = last['MA20'] if not pd.isna(last['MA20']) else price, last['MA60'] if not pd.isna(last['MA60']) else price
         upper, lower = last['upper'] if not pd.isna(last['upper']) else price*2, last['lower'] if not pd.isna(last['lower']) else price*0.5
+        filter_band = atr * 0.3
 
-        # 多周期共振过滤
+        # 60分钟共振过滤
         m60_overbought = False
         if data_60:
             df60 = pd.DataFrame(data_60)
             low60 = df60['low'].rolling(window=9).min(); high60 = df60['high'].rolling(window=9).max()
             rsv60 = (df60['close'] - low60) / (high60 - low60) * 100
-            j60 = (3 * rsv60.ewm(com=2, adjust=False).mean() - 2 * rsv60.ewm(com=2, adjust=False).mean().ewm(com=2, adjust=False).mean()).iloc[-1]
+            k60 = rsv60.ewm(com=2, adjust=False).mean(); d60 = k60.ewm(com=2, adjust=False).mean()
+            j60 = (3 * k60 - 2 * d60).iloc[-1]
             if j60 > 90: m60_overbought = True
 
-        if last['close'] > ma20 and ma20 > ma60:
-            if last['close'] >= upper: stage, desc, order_type, stop_loss = "多头极值(超买)", "顶破布林带上轨，防暴跌。", "观望", 0; action_plan = f"🚫 严禁追多，获利了结。"
-            elif last['J'] > 80 or (last['MACD'] > 0 and last['MACD'] < prev['MACD']): stage, desc, order_type, stop_loss = "多头后期", "动能衰竭，等跌破MA20再反手。", "观望", 0; action_plan = f"🛡️ 只平多不开空。"
-            elif m60_overbought: stage, desc, order_type, stop_loss = "日线多头", "⚠️但60分钟严重超买，短线有回调需求。", "观望", 0; action_plan = f"👀 等60分钟回调企稳，或等回踩 <b>{ma20:.0f}</b> 再进多。"
+        if gap_pct > 1.5:
+            stage, desc, order_type, stop_loss = "极端跳空", "开盘跳空超1.5%，原指标失效。", "观望", 0
+            action_plan = f"🛑 等待缺口回补，或站稳均线（{ma20:.0f}）再操作。"
+
+        elif last['close'] > ma20 and ma20 > ma60:
+            if vol_price_state == "减仓上涨":
+                stage, desc, order_type, stop_loss = "多头陷阱", "价格在涨，但持仓量在减！虚涨，严禁追多！", "观望", 0
+                action_plan = f"🚫 严禁追多：主力在撤退，多单赶紧落袋。"
+            elif last['close'] >= upper: 
+                stage, desc, order_type, stop_loss = "多头极值(超买)", "顶破布林带上轨，防暴跌。", "观望", 0
+                action_plan = f"🚫 严禁追多，获利了结。"
+            elif last['J'] > 80 or (last['MACD'] > 0 and last['MACD'] < prev['MACD']): 
+                stage, desc, order_type, stop_loss = "多头后期", "动能衰竭，等跌破MA20再反手。", "观望", 0
+                action_plan = f"🛡️ 只平多不开空。"
+            elif m60_overbought:
+                stage, desc, order_type, stop_loss = "日线多头", "⚠️但60分钟严重超买，短线有回调需求。", "观望", 0
+                action_plan = f"👀 等60分钟回调企稳，或等回踩 <b>{ma20:.0f}</b> 再进多。"
             else:
-                stage, desc, order_type = "多头中期", "红柱放大，趋势正猛。", "做多"; stop_loss = ma20 - (atr * 1.0)
-                action_plan = f"🚀 顺势做多：回踩 <b>{ma20 + (atr*0.2):.0f}</b> 加 1 手多。<br>🚫 止损：<b>{stop_loss:.0f}</b>。"
+                stage, desc, order_type = "多头中期", "增仓上涨/红柱放大，趋势正猛。", "做多"
+                stop_loss = ma20 - (atr * 1.0)
+                buy_point = max(ma20 + filter_band, price)
+                action_plan = f"🚀 顺势做多：站稳 <b>{buy_point:.0f}</b> 加 1 手多。<br>🚫 止损：<b>{stop_loss:.0f}</b>。"
         
         elif last['close'] < ma20 and ma20 < ma60:
-            if last['close'] <= lower: stage, desc, order_type, stop_loss = "空头极值(超卖)", "跌破布林带下轨，防报复性反弹。", "观望", 0; action_plan = f"🚫 严禁追空，获利了结。"
-            elif last['J'] < 20 or (last['MACD'] < 0 and last['MACD'] > prev['MACD']): stage, desc, order_type, stop_loss = "空头后期", "动能衰竭，等突破MA20再反手。", "观望", 0; action_plan = f"🛡️ 只平空不开多。"
+            if vol_price_state == "减仓下跌":
+                stage, desc, order_type, stop_loss = "空头陷阱", "价格在跌，但持仓量在减！虚跌，严禁追空！", "观望", 0
+                action_plan = f"🚫 严禁追空：空单赶紧落袋。"
+            elif last['close'] <= lower: 
+                stage, desc, order_type, stop_loss = "空头极值(超卖)", "跌破布林带下轨，防反弹。", "观望", 0
+                action_plan = f"🚫 严禁追空，获利了结。"
+            elif last['J'] < 20 or (last['MACD'] < 0 and last['MACD'] > prev['MACD']): 
+                stage, desc, order_type, stop_loss = "空头后期", "动能衰竭，等突破MA20再反手。", "观望", 0
+                action_plan = f"🛡️ 只平空不开多。"
             else:
-                stage, desc, order_type = "空头中期", "绿柱放大，趋势极弱。", "做空"; stop_loss = ma20 + (atr * 1.0)
-                action_plan = f"🔪 顺势做空：反弹到 <b>{ma20 - (atr*0.2):.0f}</b> 加 1 手空。<br>🚫 止损：<b>{stop_loss:.0f}</b>。"
+                stage, desc, order_type = "空头中期", "增仓下跌/绿柱放大，趋势极弱。", "做空"
+                stop_loss = ma20 + (atr * 1.0)
+                sell_point = min(ma20 - filter_band, price)
+                action_plan = f"🔪 顺势做空：跌破 <b>{sell_point:.0f}</b> 加 1 手空。<br>🚫 止损：<b>{stop_loss:.0f}</b>。"
         else:
-            stage, desc, order_type, stop_loss = "观望", "均线纠缠，方向不明。", "观望", 0; action_plan = "🛑 多看少动。"
+            stage, desc, order_type, stop_loss = "观望", "均线纠缠，方向不明。", "观望", 0
+            action_plan = "🛑 多看少动。"
 
-        # 动能的兜底
         mom = "红柱放大，多头动能强。" if last['MACD']>0 and last['MACD']>prev['MACD'] else ("绿柱放大，空头动能强。" if last['MACD']<0 and last['MACD']<prev['MACD'] else "动能交替，面临变盘。")
         kdj = f"J值{last['J']:.0f}，" + ("严重超买。" if last['J']>80 else ("严重超卖。" if last['J']<20 else "情绪正常。"))
+        
+        action_plan += f"<br>🏃 <b>加仓与保本：</b>盈利超1倍ATR({atr*1.0:.0f}点)，推保本；盈利超2倍ATR，推移动止损。"
 
-        return stage, desc, mom, kdj, source_label, action_plan, order_type, price, stop_loss
-    except:
+        return stage, desc, vol_price_state, kdj, source_label, action_plan, order_type, price, stop_loss
+    except Exception as e:
         return "观望", "解析异常。", "未知", "未知", "报错", "观望为主。", "观望", price, 0
 
-# ================= 真实的持仓急救计算器 =================
+# ================= 5. 持仓急救逻辑 =================
 def get_position_advice(pos, current_price):
     dir_str = pos['dir']
     mult = MULTIPLIER.get(pos['name'], 10)
-    # 盈亏 = (现价 - 均价) * 手数 * 乘数 * (1 if 多 else -1)
     pnl = (current_price - pos['avg']) * pos['lots'] * mult if dir_str == "多" else (pos['avg'] - current_price) * pos['lots'] * mult
     
+    slip_pt = 3 # 防扫损滑点
     if pnl < 0:
-        # 亏损单处理
         if dir_str == "空":
-            # 空单被套，解套点在均价，减仓点在现价上方阻力
-            cut_price = current_price + (pos['avg'] - current_price) * 0.5 # 反弹一半减仓
-            return f"⚠️ 浮亏 {int(pnl)}元。反弹到 <b>{cut_price:.0f}</b> 附近必须减半仓（平{int(pos['lots']/2)+1}手），避免深套。"
+            cut_price = current_price + (pos['avg'] - current_price) * 0.5 
+            return f"⚠️ 浮亏 {int(pnl)}元。反弹到 <b>{cut_price:.0f}</b> 附近必须减半仓。软件设条件单时，止损价多填 <b>{slip_pt}</b> 个点，防扫损。"
         else:
             cut_price = current_price - (current_price - pos['avg']) * 0.5
-            return f"⚠️ 浮亏 {int(pnl)}元。跌破 <b>{cut_price:.0f}</b> 附近必须减半仓（平{int(pos['lots']/2)+1}手），避免深套。"
+            return f"⚠️ 浮亏 {int(pnl)}元。跌破 <b>{cut_price:.0f}</b> 附近必须减半仓。软件设条件单时，止损价多填 <b>{slip_pt}</b> 个点，防扫损。"
     else:
-        # 盈利单处理
-        return f"✅ 浮盈 {int(pnl)}元。**保本铁律**：立刻将止损推到开仓价 {pos['avg']}，让利润奔跑！"
+        return f"✅ 浮盈 {int(pnl)}元。**保本铁律**：立刻将止损推到开仓价 {pos['avg']}（加 {slip_pt} 个点缓冲），让利润奔跑！"
 
+# ================= 6. HTML 生成与推送 =================
 def build_html():
     now = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime('%m-%d %H:%M')
     quotes = get_realtime_quotes()
     oil_pct, dxy_pct, vix_str = get_macro_data()
     
-    # 分离焦煤和主要品种
     coking_coal = next((q for q in quotes if q["name"] == "焦煤"), None)
     main_quotes = [q for q in quotes if q["name"] != "焦煤"]
     price_dict = {q["name"]: q["price"] for q in main_quotes}
 
     html = f'<div style="font-family:-apple-system,sans-serif;max-width:600px;color:#000;font-size:14px;">'
     html += f'<div style="background:linear-gradient(135deg,#1a3c6e,#2b5aa0);color:#fff;text-align:center;padding:12px;border-radius:8px;font-size:16px;font-weight:bold;">顶级期货实战指令<br><span style="font-size:12px;">{now} | 权益:{CAPITAL:,}</span></div>'
+
+    # 换月警告
+    month = datetime.datetime.now().month
+    if month in [11, 12]:
+        html += f'<div style="background:#ffebee;border:2px solid #d32f2f;border-radius:6px;padding:10px;margin:10px 0;font-size:14px;text-align:center;color:#b71c1c;font-weight:bold;">'
+        html += f'🚨 <b>时间警报：01 合约即将交割！</b><br>'
+        html += f'主力正在移仓换月，流动性骤降，极易假突破，严禁开新仓！'
+        html += f'</div>'
 
     # 宏观面板
     html += f'<div style="background:#f5f7fa;border:1px solid #d9d9d9;border-radius:6px;padding:8px;margin:10px 0;font-size:13px;text-align:center;color:#000;">'
@@ -211,7 +262,7 @@ def build_html():
         stage, trend_desc, macd_desc, kdj_desc, source_label, action_plan, order_type, buy_price, stop_loss = get_tech_analysis(q)
         analysis_results.append({"q": q, "order_type": order_type, "buy": buy_price, "stop": stop_loss})
         
-        color_map = {"空头": ("#f6ffed", "#52c41a"), "多头": ("#fff5f5", "#ff4d4f")}
+        color_map = {"空头": ("#f6ffed", "#52c41a"), "多头": ("#fff5f5", "#ff4d4f"), "跳空": ("#fff8e1", "#f57c00"), "陷阱": ("#fff8e1", "#f57c00")}
         bg_color, border_color = "#f5f5f5", "#d9d9d9"
         for k, v in color_map.items():
             if k in stage: bg_color, border_color = v; break
@@ -219,10 +270,15 @@ def build_html():
         html += f'<div style="background:{bg_color}; border:2px solid {border_color}; border-radius:8px; padding:12px; margin-bottom:12px;">'
         html += f'<div style="font-size:16px; font-weight:bold; margin-bottom:8px; border-bottom:1px dashed #ccc; padding-bottom:6px;">'
         html += f'{q["name"]} {q["code"]}：<span style="font-size:20px;">{q["price"]}</span> ({q["pct"]:+.2f}%)<span style="font-size:10px; color:#888; float:right;">{source_label}</span></div>'
-        html += f'<div style="font-size:14px; line-height:1.7;">👉 <b>阶段：</b>{stage}<br>💬 <b>趋势：</b>{trend_desc}<br>🔥 <b>动能：</b>{macd_desc}<br>🌡️ <b>温度：</b>{kdj_desc}<br>'
+        
+        # 极端行情涨停警告
+        if abs(q["pct"]) > 6.0:  
+            html += f'<div style="background:#d32f2f;color:#fff;padding:6px;border-radius:4px;margin-bottom:8px;font-size:12px;font-weight:bold;">🚨 极端行情：涨跌幅超 6%，随时封板！禁止追单！</div>'
+
+        html += f'<div style="font-size:14px; line-height:1.7;">👉 <b>阶段：</b>{stage}<br>💬 <b>趋势：</b>{trend_desc}<br>🔥 <b>动能/量仓：</b>{macd_desc}<br>🌡️ <b>温度：</b>{kdj_desc}<br>'
         html += f'<div style="background:#fff; border:2px solid {border_color}; padding:10px; border-radius:6px; margin-top:10px;"><div style="font-weight:bold; color:{border_color};">🎯 指令：</div>{action_plan}</div></div></div>'
 
-    # 资金阶梯
+    # 仓位阶梯
     html += f'<div style="background:#e3f2fd;border-left:4px solid #1e88e5;border-radius:6px;padding:12px;margin:15px 0 10px 0;">'
     html += f'<div style="font-size:16px;font-weight:bold;margin-bottom:6px;color:#000;">🛡️ 仓位控制 (死亏上限 {RISK_PER_TRADE}元)</div>'
     for res in analysis_results:
@@ -235,7 +291,7 @@ def build_html():
             html += f'<div style="font-size:13px;color:#000;background:#fff;padding:6px;margin-bottom:4px;border-radius:4px;"><b>{q["name"]} ({res["order_type"]})</b>：{res["buy"]:.0f}进场，{res["stop"]:.0f}止损。1手亏{money:.0f}元。最多<b>{max_l}手</b>，首仓<b>{first_l}手</b>。</div>'
     html += f'</div>'
 
-    # ================= 真实的持仓急救计算器 =================
+    # 持仓急救与诊断
     if POSITIONS:
         html += f'<div style="background:#ffebee;border-left:4px solid #d32f2f;border-radius:6px;padding:12px;margin:10px 0;">'
         html += f'<div style="font-size:16px;font-weight:bold;margin-bottom:8px;color:#000;">🚨 持仓真实急救</div>'
@@ -245,18 +301,36 @@ def build_html():
                 advice = get_position_advice(p, cur_price)
                 html += f'<div style="font-size:13px;line-height:1.6;margin-bottom:6px;background:#fff;padding:6px;border-radius:4px;border:1px solid #ffcdd2;">'
                 html += f'<b>{p["name"]} {p["dir"]}{p["lots"]}手</b>：{advice}</div>'
+        
+        html += f'<div style="font-size:12px;color:#b71c1c;background:#fff3f3;padding:8px;border-radius:4px;margin-top:8px;border:1px solid #ffcdd2;line-height:1.5;">'
+        html += f'🔍 <b>账户敞口诊断：</b>当前持仓高度集中在【能化板块】。若原油异动，面临板块单边双杀风险。切忌同向开仓！'
+        html += f'</div>'
         html += f'</div>'
 
+    # 情绪熔断
+    html += f'<div style="border-top:1px dashed #999; margin-top:15px; padding-top:10px; font-size:12px; color:#555; line-height:1.5;">'
+    html += f'💡 <b>情绪熔断提醒：</b>如果你最近三天累计亏损超过 {int(CAPITAL * 0.03):,} 元，说明当前行情不适合你的节奏。请强制空仓休息一天，严禁报复性交易！'
+    html += f'</div>'
+    html += f'</div>'
+    
     return html
 
 def main():
     token = os.environ.get("PUSHPLUS_TOKEN")
-    if not token: return
+    if not token: 
+        print("❌ 未在Secrets中配置PUSHPLUS_TOKEN")
+        return
+    
     content = build_html()
     payload = {"token": token, "title": "顶级期货实战指令", "content": content, "template": "html"}
     try:
-        requests.post("https://www.pushplus.plus/send", json=payload, timeout=30)
-    except: pass
+        resp = requests.post("https://www.pushplus.plus/send", json=payload, timeout=30)
+        if resp.json().get("code") == 200:
+            print("✅ 推送成功")
+        else:
+            print(f"❌ 推送失败: {resp.json().get('msg')}")
+    except Exception as e:
+        print(f"❌ 网络错误: {e}")
 
 if __name__ == "__main__":
     main()
