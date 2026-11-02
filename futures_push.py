@@ -1,6 +1,5 @@
 # encoding:utf-8
 import os, json, requests, datetime
-import pandas as pd
 
 # ================= 你的账户核心数据 =================
 CAPITAL = 289485
@@ -13,7 +12,7 @@ TOTAL_PNL = -42055
 MULTIPLIER = {"甲醇": 10, "PVC": 5, "白糖": 10}
 # ====================================================
 
-# 获取实时期货价格 (保持新浪)
+# 获取实时期货价格 (包含开、高、低、现价)
 def get_realtime_quotes():
     symbols = {"甲醇": "nf_MA2701", "PVC": "nf_V2701", "白糖": "nf_SR2701"}
     url = "http://hq.sinajs.cn/list=" + ",".join(symbols.values())
@@ -27,115 +26,83 @@ def get_realtime_quotes():
                 name_code = parts[0]
                 name = "".join([c for c in name_code if not c.isdigit()])
                 code = "".join([c for c in name_code if c.isdigit()])
+                
+                open_p = float(parts[1]) if parts[1] else 0
+                high_p = float(parts[2]) if parts[2] else 0
+                low_p = float(parts[3]) if parts[3] else 0
                 price = float(parts[8]) if parts[8] else float(parts[4])
                 pre_settle = float(parts[4]) if parts[4] else 1
+                
                 pct = round((price - pre_settle) / pre_settle * 100, 2) if pre_settle != 0 else 0
                 color = "#b71c1c" if pct >= 0 else "#1b5e20"
-                quotes.append({"name": name, "code": code, "price": price, "pct": pct, "color": color})
+                
+                quotes.append({
+                    "name": name, "code": code, "price": price, "pct": pct, "color": color,
+                    "open": open_p, "high": max(high_p, low_p), "low": min(high_p, low_p)
+                })
         return quotes
     except Exception as e:
         return []
 
-# 获取历史K线并计算指标 (使用腾讯接口)
-def get_tech_analysis(name, code):
-    # 腾讯期货代码映射
-    prefix_map = {"甲醇": "MA", "PVC": "V", "白糖": "SR"}
-    symbol = f"{prefix_map.get(name, '')}{code}"
-    url = f"https://web.ifzq.gtimg.cn/appstock/app/kline/kline?param={symbol},day,,,120"
+# ================= 日内指标推演算法 =================
+def get_dynamic_analysis(q):
+    open_p = q["open"]
+    high_p = q["high"]
+    low_p = q["low"]
+    price = q["price"]
     
-    headers = {"User-Agent": "Mozilla/5.0"}
+    if high_p == low_p:
+        return "日内震荡", "今天还没啥波动，都在观望。", "动能未明", "温度未知"
+        
+    # 算振幅
+    amp = round((high_p - low_p) / low_p * 100, 2)
     
-    try:
-        res = requests.get(url, headers=headers, timeout=10).json()
-        data_dict = res.get('data', {})
-        
-        # 腾讯的返回结构比较深，需要层层提取
-        if not data_dict or symbol not in data_dict or 'day' not in data_dict[symbol]:
-            raise ValueError("腾讯接口未返回该品种的K线")
-            
-        klines = data_dict[symbol]['day']
-        
-        data = []
-        for k in klines:
-            # 腾讯格式: [日期, 开, 收, 高, 低, 量]
-            data.append({
-                'close': float(k[2]),
-                'high': float(k[3]),
-                'low': float(k[4])
-            })
-            
-        df = pd.DataFrame(data)
-        
-        # 计算均线
-        df['MA20'] = df['close'].rolling(window=20).mean()
-        df['MA60'] = df['close'].rolling(window=60).mean()
-        
-        # 计算 MACD
-        exp1 = df['close'].ewm(span=12, adjust=False).mean()
-        exp2 = df['close'].ewm(span=26, adjust=False).mean()
-        df['DIFF'] = exp1 - exp2
-        df['DEA'] = df['DIFF'].ewm(span=9, adjust=False).mean()
-        df['MACD'] = (df['DIFF'] - df['DEA']) * 2
-        
-        # 计算 KDJ
-        low_min = df['low'].rolling(window=9).min()
-        high_max = df['high'].rolling(window=9).max()
-        rsv = (df['close'] - low_min) / (high_max - low_min) * 100
-        df['K'] = rsv.ewm(com=2, adjust=False).mean()
-        df['D'] = df['K'].ewm(com=2, adjust=False).mean()
-        df['J'] = 3 * df['K'] - 2 * df['D']
+    # 1. 判断大方向 (价格在日内区间的位置)
+    # 如果收盘价在日内最高点的 80% 以上，说明强势
+    if price >= low_p + (high_p - low_p) * 0.8:
+        stage = "多头强势"
+        trend_desc = f"价格收在全天最高点附近（{price}），大方向偏多，多头占绝对优势。"
+    # 如果收盘价在日内最低点的 20% 以下，说明弱势
+    elif price <= low_p + (high_p - low_p) * 0.2:
+        stage = "空头强势"
+        trend_desc = f"价格收在全天最低点附近（{price}），大方向偏空，空头在疯狂砸盘。"
+    else:
+        stage = "多空震荡"
+        trend_desc = "价格卡在全天中间位置，多空双方互道SB，没分出胜负。"
 
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
+    # 2. 判断资金动能 (开盘价与现价的关系)
+    if price > open_p and price >= high_p - (high_p - low_p) * 0.1:
+        macd_momentum = "开盘后就一路往上拉，资金在抢筹码，多头动能极其充沛。"
+    elif price < open_p and price <= low_p + (high_p - low_p) * 0.1:
+        macd_momentum = "开盘后就一路往下砸，资金在疯狂出逃，空头动能极强。"
+    elif price > open_p:
+        macd_momentum = "虽然收红，但冲高回落了，资金在逢高撤退，上方压力大。"
+    elif price < open_p:
+        macd_momentum = "虽然收绿，但探底回升了，资金在逢低接盘，下方有支撑。"
+    else:
+        macd_momentum = "围绕开盘价上下震荡，资金没明确方向。"
+
+    # 3. 判断短线情绪 (振幅)
+    if amp > 3.0:
+        kdj_momentum = f"今天振幅高达{amp}%，波动极其剧烈，短线情绪过热，随时会暴力洗盘。"
+    elif amp > 1.5:
+        kdj_momentum = f"今天振幅{amp}%，波动正常，跟着大方向做就行。"
+    else:
+        kdj_momentum = f"今天振幅只有{amp}%，像一潭死水，尽量别去碰。"
         
-        # ================= 大白话分析逻辑 =================
-        if last['close'] > last['MA20'] and last['MA20'] > last['MA60']:
-            trend_stage = "长线大牛市"
-            trend_desc = "价格踩在所有均线上方，大方向坚决看涨，回踩就是机会。"
-        elif last['close'] < last['MA20'] and last['MA20'] < last['MA60']:
-            trend_stage = "长线大熊市"
-            trend_desc = "价格被所有均线压着打，大方向坚决看跌，反弹就是诱多。"
-        elif last['close'] > last['MA60']:
-            trend_stage = "长线多头，短线洗盘"
-            trend_desc = "大方向还在涨，但最近几天有点涨不动了，在回调休息。"
-        else:
-            trend_stage = "长线空头，短线反弹"
-            trend_desc = "大方向还在跌，但最近几天跌不动了，空头在平仓撤退。"
-
-        if last['MACD'] > 0 and prev['MACD'] <= 0:
-            macd_momentum = "刚出红柱（金叉），资金开始进场，要涨。"
-        elif last['MACD'] > 0 and last['MACD'] > prev['MACD']:
-            macd_momentum = "红柱持续放大，资金在猛冲，多头很强。"
-        elif last['MACD'] < 0 and prev['MACD'] >= 0:
-            macd_momentum = "刚出绿柱（死叉），资金开始撤退，要跌。"
-        elif last['MACD'] < 0 and last['MACD'] < prev['MACD']:
-            macd_momentum = "绿柱持续放大，资金在狂砸，空头很强。"
-        else:
-            macd_momentum = "红绿柱在缩小，涨跌动能都在衰竭，快变盘了。"
-
-        if last['J'] > 80:
-            kdj_momentum = f"J值高达{last['J']:.0f}，短线严重超买，随时会大回调，千万别追。"
-        elif last['J'] < 20:
-            kdj_momentum = f"J值低至{last['J']:.0f}，短线严重超卖，随时会大反弹，别追空。"
-        else:
-            kdj_momentum = f"J值处于{last['J']:.0f}，短线情绪正常，跟着大方向做就行。"
-            
-        return trend_stage, trend_desc, macd_momentum, kdj_momentum
-    except Exception as e:
-        print(f"解析 {name} 数据失败: {e}")
-        return "日内震荡", "历史数据暂不可用，纯看日内表现。", "动能未明", "短线温度未知"
+    return stage, trend_desc, macd_momentum, kdj_momentum
 
 def build_html():
     now = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime('%m-%d %H:%M')
     quotes = get_realtime_quotes()
 
     html = f'<div style="font-family:-apple-system,sans-serif;max-width:600px;color:#000;font-size:14px;">'
-    html += f'<div style="background:linear-gradient(135deg,#1a3c6e,#2b5aa0);color:#fff;text-align:center;padding:12px;border-radius:8px;font-size:16px;font-weight:bold;">期货深度盯盘（指标版）<br><span style="font-size:12px;">{now} | 权益:{CAPITAL:,}</span></div>'
+    html += f'<div style="background:linear-gradient(135deg,#1a3c6e,#2b5aa0);color:#fff;text-align:center;padding:12px;border-radius:8px;font-size:16px;font-weight:bold;">期货深度盯盘（日内版）<br><span style="font-size:12px;">{now} | 权益:{CAPITAL:,}</span></div>'
 
     html += f'<div style="font-size:16px;font-weight:bold;margin:15px 0 10px 0;text-align:center;color:#000;">📌 核心速览（多红空绿）</div>'
 
     for q in quotes:
-        stage, trend_desc, macd_desc, kdj_desc = get_tech_analysis(q["name"], q["code"])
+        stage, trend_desc, macd_desc, kdj_desc = get_dynamic_analysis(q)
         
         if q["pct"] > 0:
             bg_color, border_color = "#fff5f5", "#ff4d4f"
@@ -177,10 +144,10 @@ def build_html():
         for p in POSITIONS:
             html += f'<div style="font-size:13px;line-height:1.6;margin-bottom:4px;color:#000;">{p["name"]} <b>{p["dir"]}{p["lots"]}手</b> (均价{p["avg"]}) | 盈亏: {p["pnl"]:+}元</div>'
         html += f'<div style="font-size:13px;color:#000;background:#fff;padding:8px;border-radius:4px;margin-top:8px;border:1px solid #ffcdd2;">'
-        html += f'<b>大白话建议：</b>你手里拿的是空单，如果上面的分析显示目前是“大牛市”或者“资金动能强”，赶紧逢高减仓，别死扛了！千万别逆着大趋势加仓。'
+        html += f'<b>大白话建议：</b>你手里拿的是空单，如果上面的分析显示目前是“多头强势”，千万别逆势加仓，赶紧找机会减仓。'
         html += f'</div></div>'
 
-    html += f'<div style="color:#666;font-size:12px;text-align:center;margin-top:15px;">数据来源：新浪财经 & 腾讯财经 | 指标依据：MA、MACD、KDJ 综合判定</div>'
+    html += f'<div style="color:#666;font-size:12px;text-align:center;margin-top:15px;">数据来源：新浪财经 | 综合日内趋势判定</div>'
     return html
 
 def main():
@@ -189,7 +156,7 @@ def main():
         print("❌ 未在Secrets中配置PUSHPLUS_TOKEN")
         return
     content = build_html()
-    payload = {"token": token, "title": "期货深度盯盘（指标版）", "content": content, "template": "html"}
+    payload = {"token": token, "title": "期货深度盯盘（日内版）", "content": content, "template": "html"}
     try:
         resp = requests.post("https://www.pushplus.plus/send", json=payload, timeout=30)
         result = resp.json()
