@@ -101,15 +101,29 @@ def get_tech_analysis(q):
             history_list = update_history(name, code, price, high, low, oi)
             if len(history_list) < 20:
                 source_label = f"自建库({len(history_list)}/20)"
-                if price >= low + diff * 0.7 and price > open_p: 
-                    stage, desc = "多头中期(日内)", "日内多头占优。"; order_type = "做多"; stop_loss = low - (atr * 0.3)
-                    action_plan = f"🛑 轻仓试多：现价 <b>{price}</b>。<br>🚫 止损：<b>{stop_loss:.0f}</b>。"
-                elif price <= low + diff * 0.3 and price < open_p: 
-                    stage, desc = "空头中期(日内)", "日内空头占优。"; order_type = "做空"; stop_loss = high + (atr * 0.3)
-                    action_plan = f"🛑 轻仓试空：现价 <b>{price}</b>。<br>🚫 止损：<b>{stop_loss:.0f}</b>。"
-                else: 
-                    stage, desc, order_type, stop_loss = "观望", "卡在中间，日内外无方向。", "观望", 0
+                
+                # ============ 修复测试期“逆势陷阱” ============
+                # 红盘时，如果冲高回落，绝不提示做空；绿盘时，如果探底回升，绝不提示做多
+                if price > pre_settle: # 当日红盘
+                    if price >= low + diff * 0.7 and price > open_p: 
+                        stage, desc = "日内多头", "红盘且强势，顺势做多。"; order_type = "做多"; stop_loss = low - (atr * 0.3)
+                        action_plan = f"🛑 轻仓试多：现价 <b>{price}</b>。<br>🚫 止损：<b>{stop_loss:.0f}</b>。"
+                    else:
+                        stage, desc, order_type, stop_loss = "观望", "虽然红盘，但高开低走/冲高回落，多空分歧大。", "观望", 0
+                        action_plan = f"🛑 多看少动：数据不足期，宁可错过，不逆势做空红盘。"
+                
+                elif price < pre_settle: # 当日绿盘
+                    if price <= low + diff * 0.3 and price < open_p: 
+                        stage, desc = "日内空头", "绿盘且弱势，顺势做空。"; order_type = "做空"; stop_loss = high + (atr * 0.3)
+                        action_plan = f"🛑 轻仓试空：现价 <b>{price}</b>。<br>🚫 止损：<b>{stop_loss:.0f}</b>。"
+                    else:
+                        stage, desc, order_type, stop_loss = "观望", "虽然绿盘，但探底回升，多空分歧大。", "观望", 0
+                        action_plan = f"🛑 多看少动：数据不足期，宁可错过，不逆势做多绿盘。"
+                
+                else: # 平盘
+                    stage, desc, order_type, stop_loss = "观望", "平盘震荡，无方向。", "观望", 0
                     action_plan = f"🛑 多看少动。"
+                    
                 return stage, desc, vol_price_state, "日内波动", source_label, action_plan, order_type, price, stop_loss
             else:
                 data_d = history_list; source_label = "自建库"
@@ -187,7 +201,6 @@ def get_tech_analysis(q):
         action_plan += f"<br>🏃 <b>加仓与保本：</b>盈利超1倍ATR({atr*1.0:.0f}点)，推保本；盈利超2倍ATR，推移动止损。"
         return stage, desc, vol_price_state, kdj, source_label, action_plan, order_type, price, stop_loss
     except Exception as e:
-        print(f"Error analyzing {q.get('name')}: {e}")
         return "观望", "解析异常。", "未知", "未知", "报错", "观望为主。", "观望", q.get("price", 0), 0
 
 def get_position_advice(pos, current_price):
