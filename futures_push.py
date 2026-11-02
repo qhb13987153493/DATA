@@ -1,7 +1,7 @@
 # encoding:utf-8
 import os, json, requests, datetime
 import pandas as pd
-import numpy as np
+import akshare as ak
 
 # ================= 你的账户核心数据 =================
 CAPITAL = 289485
@@ -14,7 +14,7 @@ TOTAL_PNL = -42055
 MULTIPLIER = {"甲醇": 10, "PVC": 5, "白糖": 10}
 # ====================================================
 
-# 获取实时期货价格
+# 获取实时期货价格（保持不变）
 def get_realtime_quotes():
     symbols = {"甲醇": "nf_MA2701", "PVC": "nf_V2701", "白糖": "nf_SR2701"}
     url = "http://hq.sinajs.cn/list=" + ",".join(symbols.values())
@@ -37,65 +37,55 @@ def get_realtime_quotes():
     except:
         return []
 
-# 获取历史K线并计算MACD、KDJ、均线
+# 修复核心：使用 AkShare 获取历史日K线
 def get_tech_analysis(name, code):
-    # 新浪期货日K线接口
-    symbol = f"{name}{code}"
-    url = f"https://stock2.finance.sina.com.cn/futures/api/jsonp.php/var%20_{symbol}=/InnerFuturesNewService.getDailyKLine?symbol={symbol}"
     try:
-        res = requests.get(url, timeout=10).text
-        # 清洗 JSONP 格式
-        json_str = res.split('(')[1].split(');')[0]
-        data = json.loads(json_str)
+        # AkShare 获取期货日线数据，格式：MA2701
+        symbol = f"{name}{code}"
+        df = ak.futures_zh_daily_sina(symbol=symbol)
         
-        df = pd.DataFrame(data)
-        df['c'] = df['c'].astype(float)
-        df['h'] = df['h'].astype(float)
-        df['l'] = df['l'].astype(float)
+        # 截取最近120个交易日，保证有足够数据计算指标
+        df = df.tail(120).reset_index(drop=True)
+        df['close'] = df['close'].astype(float)
+        df['high'] = df['high'].astype(float)
+        df['low'] = df['low'].astype(float)
         
         # 1. 计算均线 (MA20, MA60)
-        df['MA20'] = df['c'].rolling(window=20).mean()
-        df['MA60'] = df['c'].rolling(window=60).mean()
+        df['MA20'] = df['close'].rolling(window=20).mean()
+        df['MA60'] = df['close'].rolling(window=60).mean()
         
         # 2. 计算 MACD (12, 26, 9)
-        exp1 = df['c'].ewm(span=12, adjust=False).mean()
-        exp2 = df['c'].ewm(span=26, adjust=False).mean()
+        exp1 = df['close'].ewm(span=12, adjust=False).mean()
+        exp2 = df['close'].ewm(span=26, adjust=False).mean()
         df['DIFF'] = exp1 - exp2
         df['DEA'] = df['DIFF'].ewm(span=9, adjust=False).mean()
         df['MACD'] = (df['DIFF'] - df['DEA']) * 2
         
         # 3. 计算 KDJ (9, 3, 3)
-        low_min = df['l'].rolling(window=9).min()
-        high_max = df['h'].rolling(window=9).max()
-        rsv = (df['c'] - low_min) / (high_max - low_min) * 100
+        low_min = df['low'].rolling(window=9).min()
+        high_max = df['high'].rolling(window=9).max()
+        rsv = (df['close'] - low_min) / (high_max - low_min) * 100
         df['K'] = rsv.ewm(com=2, adjust=False).mean()
         df['D'] = df['K'].ewm(com=2, adjust=False).mean()
         df['J'] = 3 * df['K'] - 2 * df['D']
 
-        # 取最新一天的数据
         last = df.iloc[-1]
         prev = df.iloc[-2]
         
         # ================= 大白话分析逻辑 =================
-        trend_stage = ""
-        trend_desc = ""
-        
-        # 大方向判定（均线）
-        if last['c'] > last['MA20'] and last['MA20'] > last['MA60']:
+        if last['close'] > last['MA20'] and last['MA20'] > last['MA60']:
             trend_stage = "长线大牛市"
             trend_desc = "价格踩在所有均线上方，大方向坚决看涨，回踩就是机会。"
-        elif last['c'] < last['MA20'] and last['MA20'] < last['MA60']:
+        elif last['close'] < last['MA20'] and last['MA20'] < last['MA60']:
             trend_stage = "长线大熊市"
             trend_desc = "价格被所有均线压着打，大方向坚决看跌，反弹就是诱多。"
-        elif last['c'] > last['MA60']:
+        elif last['close'] > last['MA60']:
             trend_stage = "长线多头，短线洗盘"
             trend_desc = "大方向还在涨，但最近几天有点涨不动了，在回调休息。"
         else:
             trend_stage = "长线空头，短线反弹"
             trend_desc = "大方向还在跌，但最近几天跌不动了，空头在平仓撤退。"
 
-        # 动能判定（MACD）
-        macd_momentum = ""
         if last['MACD'] > 0 and prev['MACD'] <= 0:
             macd_momentum = "刚出红柱（金叉），资金开始进场，要涨。"
         elif last['MACD'] > 0 and last['MACD'] > prev['MACD']:
@@ -107,8 +97,6 @@ def get_tech_analysis(name, code):
         else:
             macd_momentum = "红绿柱在缩小，涨跌动能都在衰竭，快变盘了。"
 
-        # 极端情绪判定（KDJ）
-        kdj_momentum = ""
         if last['J'] > 80:
             kdj_momentum = f"J值高达{last['J']:.0f}，短线严重超买，随时会大回调，千万别追。"
         elif last['J'] < 20:
@@ -118,6 +106,8 @@ def get_tech_analysis(name, code):
             
         return trend_stage, trend_desc, macd_momentum, kdj_momentum
     except Exception as e:
+        # 如果还是报错，把错误信息打印出来方便排查
+        print(f"获取 {name} 数据失败: {e}")
         return "分析失败", "K线数据获取异常", "请稍后再试", "请稍后再试"
 
 def build_html():
@@ -127,7 +117,6 @@ def build_html():
     html = f'<div style="font-family:-apple-system,sans-serif;max-width:600px;color:#000;font-size:14px;">'
     html += f'<div style="background:linear-gradient(135deg,#1a3c6e,#2b5aa0);color:#fff;text-align:center;padding:12px;border-radius:8px;font-size:16px;font-weight:bold;">期货深度盯盘（指标版）<br><span style="font-size:12px;">{now} | 权益:{CAPITAL:,}</span></div>'
 
-    # ================= 第一部分：独立卡片速览 =================
     html += f'<div style="font-size:16px;font-weight:bold;margin:15px 0 10px 0;text-align:center;color:#000;">📌 核心速览（多红空绿）</div>'
 
     for q in quotes:
@@ -153,7 +142,7 @@ def build_html():
         html += f'🌡️ <b>短线温度：</b>{kdj_desc}'
         html += f'</div></div>'
 
-    # ================= 第二部分：资金阶梯 =================
+    # 资金阶梯和持仓部分保持不变...
     html += f'<div style="background:#fff3e0;border-left:4px solid #f57c00;border-radius:6px;padding:12px;margin:15px 0 10px 0;">'
     html += f'<div style="font-size:16px;font-weight:bold;margin-bottom:8px;color:#000;">💰 资金阶梯分配表</div>'
     for q in quotes:
@@ -168,7 +157,6 @@ def build_html():
     html += f'<div style="font-size:12px;color:#000;margin-top:6px;font-weight:bold;">⚠️ 注意：上限是“最多能买这么多”，不是让你全买满！</div>'
     html += f'</div>'
 
-    # ================= 第三部分：持仓急救 =================
     if POSITIONS:
         html += f'<div style="background:#ffebee;border-left:4px solid #d32f2f;border-radius:6px;padding:12px;margin:10px 0;">'
         html += f'<div style="font-size:16px;font-weight:bold;margin-bottom:8px;color:#000;">🚨 持仓急救（总亏 {TOTAL_PNL:,} 元）</div>'
@@ -178,7 +166,7 @@ def build_html():
         html += f'<b>大白话建议：</b>你手里拿的是空单，如果上面的分析显示目前是“大牛市”或者“资金动能强”，赶紧逢高减仓，别死扛了！千万别逆着大趋势加仓。'
         html += f'</div></div>'
 
-    html += f'<div style="color:#666;font-size:12px;text-align:center;margin-top:15px;">数据来源新浪财经 | 指标依据：MA、MACD、KDJ 综合判定</div>'
+    html += f'<div style="color:#666;font-size:12px;text-align:center;margin-top:15px;">数据来源：新浪财经 & AkShare | 指标依据：MA、MACD、KDJ 综合判定</div>'
     return html
 
 def main():
